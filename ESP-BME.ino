@@ -8,17 +8,19 @@ forget, can't receive anything.
 #include <Adafruit_BME280.h>
 #include <ESP8266WiFi.h>
 #include <espnow.h>
-//#include <ComStruct.h>
+#include "ComStruct.h"
 
 //define static vars
 #define SEALEVELPRESSURE_HPA (1013.25)
 #define BME_VCC 15
 #define SAMPLING_COUNT 10
 #define SAMPLING_DELAY 1000
-#define SLEEP_TIME 10000//900e6
+#define SLEEP_TIME 900e6
 #define measurands { TEMPERATURE, PRESSURE, ALTITUDE, HUMIDTY }
-#define MAC_SELF { 0x84, 0xF3, 0xEB, 0x05, 0x43, 0xE8 }
-#define MAC_RECEIVER {0x84, 0x0D, 0x8E, 0xB7, 0xFE, 0x1B}
+
+// "define" MAC's as uint8_t arrays
+uint8_t MAC_SELF[] = { 0x84, 0xF3, 0xEB, 0x05, 0x43, 0xE8 };
+uint8_t MAC_RECEIVER[] = {0x84, 0x0D, 0x8E, 0xB7, 0xFE, 0x1B};
 
 Adafruit_BME280 bme;  // I2C --> I2C only available on GPIO 4+5
 
@@ -33,20 +35,33 @@ struct bme280Struct {
 * Setup function
 */
 void setup() {
-  // put your setup code here, to run once:
-  Serial.begin(115200);
-
+  // put your setup code here, to run once:  
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(BME_VCC, OUTPUT);
   digitalWrite(BME_VCC, HIGH);
   digitalWrite(LED_BUILTIN, LOW);
 
-  Serial.print("MAC address:" );
-  Serial.println(WiFi.macAddress());
+  //Important: Start Serial com after activating outputs
+  Serial.begin(115200);
+  Serial.setTimeout(2000);
+  while(!Serial) { }
 
-  bool status;
+  //Initialize WiFi
+  WiFi.mode(WIFI_STA);
+  // Serial.print("MAC address:" );
+  // Serial.println(WiFi.macAddress());
 
-  // default settings
+  //Initialize ESP_NOW
+  if (esp_now_init() != 0) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_add_peer(MAC_RECEIVER, ESP_NOW_ROLE_SLAVE, 1, NULL, 0);
+
+  //Initialize BME
+  bool status; 
   status = bme.begin(0x76);
   if (!status) {
     Serial.println("Could not find a valid BME280 sensor, check wiring!");
@@ -70,7 +85,13 @@ void loop() {
   Serial.print("\nHumidity: ");
   Serial.print(meanVals.hum);
   Serial.print("\n---------------------\nSleep");
-  ESP.deepSleep(SLEEP_TIME);
+
+  //Send to Receiver
+  esp_now_send(MAC_RECEIVER, (uint8_t *) &meanVals, sizeof(meanVals));
+
+  //Deep Sleep
+  //ESP.deepSleep(SLEEP_TIME);
+  delay(30000);
   Serial.print("Wakeup\n---------------------\n");
 }
 
@@ -109,4 +130,15 @@ void readBME280(Adafruit_BME280* sens, bme280Struct* vals) {
   vals->p = sens->readPressure() / 100.0F;
   vals->alt = sens->readAltitude(SEALEVELPRESSURE_HPA);
   vals->hum = sens->readHumidity();
+}
+
+// Callback when data is sent
+void OnDataSent(uint8_t *mac_addr, uint8_t sendStatus) {
+  Serial.print("\nLast Packet Send Status: ");
+  if (sendStatus == 0){
+    Serial.println("Delivery success");
+  }
+  else{
+    Serial.println("Delivery fail");
+  }
 }
