@@ -9,6 +9,7 @@ forget, can't receive anything.
 #include <ESP8266WiFi.h>
 #include <espnow.h>
 #include "ComStruct.h"
+#include "BME280Struct.h"
 
 //define static vars
 #define SEALEVELPRESSURE_HPA (1013.25)
@@ -16,21 +17,18 @@ forget, can't receive anything.
 #define SAMPLING_COUNT 10
 #define SAMPLING_DELAY 1000
 #define SLEEP_TIME 900e6
-#define measurands { TEMPERATURE, PRESSURE, ALTITUDE, HUMIDTY }
+#define LED_BUILTIN 1
+
+//Input voltage to analog pin
+ADC_MODE(ADC_VCC);
+char measurands[][50] = { "TEMPERATURE", "PRESSURE", "ALTITUDE", "HUMIDTY", "VOLTAGE" };
 
 // "define" MAC's as uint8_t arrays
 uint8_t MAC_SELF[] = { 0x84, 0xF3, 0xEB, 0x05, 0x43, 0xE8 };
 uint8_t MAC_RECEIVER[] = {0x84, 0x0D, 0x8E, 0xB7, 0xFE, 0x1B};
 
 Adafruit_BME280 bme;  // I2C --> I2C only available on GPIO 4+5
-
-struct bme280Struct {
-  double t;
-  double p;
-  double alt;
-  double hum;
-};
-
+int dpID = 0;
 /**
 * Setup function
 */
@@ -43,8 +41,6 @@ void setup() {
 
   //Important: Start Serial com after activating outputs
   Serial.begin(115200);
-  Serial.setTimeout(2000);
-  while(!Serial) { }
 
   //Initialize WiFi
   WiFi.mode(WIFI_STA);
@@ -86,8 +82,39 @@ void loop() {
   Serial.print(meanVals.hum);
   Serial.print("\n---------------------\nSleep");
 
-  //Send to Receiver
-  esp_now_send(MAC_RECEIVER, (uint8_t *) &meanVals, sizeof(meanVals));
+  //Send all meanVals per ESPNow
+  for(int i = 0; i< 4; i++){
+    comStruct send;
+    send.datapointID = dpID;
+     sprintf(send.id, "%lu", bme.sensorID());        
+     strcpy(send.sensorType, "bme280");
+     strcpy(send.key, measurands[i]);
+    switch(i){
+      case 0:        
+        send.dValue = meanVals.t;        
+        break;
+      case 1:
+        send.dValue = meanVals.p;        
+        break;
+      case 2:
+        send.dValue = meanVals.alt;        
+        break;
+      case 3:
+        send.dValue = meanVals.hum;        
+        break;
+    }
+    //Send to Receiver
+    esp_now_send(MAC_RECEIVER, (uint8_t *) &send, sizeof(send));
+  }
+
+  //Send ESP voltage
+  comStruct voltage;
+  voltage.datapointID = dpID++;
+  strcpy(voltage.id, "0");
+  strcpy(voltage.sensorType, "ADC_VCC");
+  strcpy(voltage.key, measurands[4]);
+  voltage.dValue = ESP.getVcc();
+  esp_now_send(MAC_RECEIVER, (uint8_t *) &voltage, sizeof(voltage));  
 
   //Deep Sleep
   //ESP.deepSleep(SLEEP_TIME);
@@ -134,11 +161,7 @@ void readBME280(Adafruit_BME280* sens, bme280Struct* vals) {
 
 // Callback when data is sent
 void OnDataSent(uint8_t *mac_addr, uint8_t sendStatus) {
-  Serial.print("\nLast Packet Send Status: ");
-  if (sendStatus == 0){
-    Serial.println("Delivery success");
-  }
-  else{
-    Serial.println("Delivery fail");
+  if (sendStatus != 0){    
+    Serial.println("\nLast Packet Send Status: Delivery fail");
   }
 }
