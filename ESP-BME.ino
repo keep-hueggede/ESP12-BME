@@ -1,13 +1,13 @@
 /******************************************
-Skecth to read from BME280 Sensor and send
+Sketch to read from BME280 Sensor and send
 per ESP-NOW to Receiver. Simple fire and 
 forget, can't receive anything.
 *******************************************/
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
-#include <ESP8266WiFi.h>
-#include <espnow.h>
+// #include <ESP8266WiFi.h>
+// #include <espnow.h>
 #include "ComStruct.h"
 #include "BME280Struct.h"
 
@@ -18,15 +18,15 @@ forget, can't receive anything.
 #define SAMPLING_DELAY 1000
 #define SLEEP_TIME 900e6
 #define LED_BUILTIN 1
-#define INTERRUPT_PIN 12
+// #define INTERRUPT_PIN 12
 
 //Input voltage to analog pin
-ADC_MODE(ADC_VCC);
-char measurands[][50] = { "TEMPERATURE", "PRESSURE", "ALTITUDE", "HUMIDTY", "VOLTAGE", "WINDSPEED" };
+// ADC_MODE(ADC_VCC);
+char measurands[][50] = { "TEMPERATURE", "PRESSURE", "ALTITUDE", "HUMIDTY", "VOLTAGE", "WINDSPEED", "RAIN" };
 
 // "define" MAC's as uint8_t arrays
-uint8_t MAC_SELF[] = { 0x84, 0xF3, 0xEB, 0x05, 0x43, 0xE8 };
-uint8_t MAC_RECEIVER[] = {0x84, 0x0D, 0x8E, 0xB7, 0xFE, 0x1B};
+// uint8_t MAC_SELF[] = { 0x84, 0xF3, 0xEB, 0x05, 0x43, 0xE8 };
+// uint8_t MAC_RECEIVER[] = {0x84, 0x0D, 0x8E, 0xB7, 0xFE, 0x1B};
 
 Adafruit_BME280 bme;  // I2C --> I2C only available on GPIO 4+5
 int dpID = 0;
@@ -43,13 +43,13 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);  
 
   //Interrupt for Windspeed
-  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), rainSensorInterrupt, FALLING);  
+  // attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), rainSensorInterrupt, FALLING);  
 
   //Important: Start Serial com after activating outputs
   Serial.begin(115200);
 
   //Initialize WiFi
-  WiFi.mode(WIFI_STA);
+  // WiFi.mode(WIFI_STA);
   // Serial.print("MAC address:" );
   // Serial.println(WiFi.macAddress());
 
@@ -126,7 +126,7 @@ void loop() {
   strcpy(voltage.sensorType, "ADC_VCC");
   strcpy(voltage.key, measurands[4]);  
   strcpy(voltage.sValue, "");
-  voltage.dValue = ESP.getVcc();
+  // voltage.dValue = ESP.getVcc();
   //esp_now_send(MAC_RECEIVER, (uint8_t *) &voltage, sizeof(voltage));   
 
 
