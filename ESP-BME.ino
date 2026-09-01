@@ -195,6 +195,27 @@ static bool joinNetwork() {
 }
 
 // --------------------------------------------------------------------------
+// I²C-Bus scannen und gefundene Adressen ausgeben (Diagnose)
+// --------------------------------------------------------------------------
+static void scanI2C() {
+  Serial.println("I²C-Scan (SDA=" + String(I2C_SDA) + ", SCL=" + String(I2C_SCL) + "):");
+  byte error, address;
+  int nDevices = 0;
+  for (address = 1; address < 127; address++) {
+    I2CBME.beginTransmission(address);
+    error = I2CBME.endTransmission();
+    if (error == 0) {
+      Serial.print("  Gerät gefunden bei 0x");
+      if (address < 16) Serial.print("0");
+      Serial.print(address, HEX);
+      Serial.println();
+      nDevices++;
+    }
+  }
+  Serial.printf("  %d Gerät(e) gefunden.\n", nDevices);
+}
+
+// --------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -210,6 +231,7 @@ void setup() {
   // BME280
   if (!bme.begin(0x76, &I2CBME)) {
     Serial.println("BME280 nicht gefunden, verdrahtung prüfen!");
+    scanI2C();
     while (1) delay(1000);
   }
 
