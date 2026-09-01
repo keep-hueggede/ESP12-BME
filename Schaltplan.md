@@ -40,8 +40,9 @@ GPIO13[10]           [10] GPIO24 (UART TX)
 | Versorgung 3,3V | 3V3          | BME280 VCC, Anemometer VCC                            |
 
 > **Hinweis zu GPIO1:** ADC1_CH0 ist am ESP32-H2 der **GPIO1** — nicht GPIO36
-> (GPIO36 kommt nur am klassischen ESP32 vor). Der Sketch verwendet `ADC1_CH0`
-> und löst damit automatisch auf GPIO1 auf.
+> (GPIO36 kommt nur am klassischen ESP32 vor). Der Sketch ruft
+> `analogRead(GPIO1)` auf — der Arduino-Core erwartet die Pin-Nummer, das
+> ESP-IDF-Makro `ADC1_CH0` existiert dort nicht.
 
 ## Stromversorgung
 

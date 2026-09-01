@@ -28,7 +28,7 @@
 #define SEALEVELPRESSURE_HPA (1013.25)
 #define I2C_SDA 4          // ESP32-H2: GPIO4 (SDA)
 #define I2C_SCL 5          // ESP32-H2: GPIO5 (SCL)
-#define ANEMOMETER ADC1_CH0 // ESP32-H2: ADC1_CH0 = GPIO1 - Anemometer analog
+#define ANEMOMETER GPIO1  // ESP32-H2: GPIO1 = ADC1_CH0, analogRead(GPIO) erwartet die Pin-Nummer
 #define INTERRUPT_PIN 12    // Regenmesser (Tipping Bucket), Interrupt
 
 // Abtastung
