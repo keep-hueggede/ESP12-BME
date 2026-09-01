@@ -1,7 +1,32 @@
 # Schaltplan — ESP-BME Wetterstation (ESP32-H2)
 
-Verdrahtung der Sensoren an den ESP32-H2 (ESP32-H2FH4S), passend zum Sketch
-`ESP-BME.ino` (Thread + CoAP).
+Verdrahtung der Sensoren an den **Waveshare ESP32-H2-Zero** (ESP32-H2FH4S),
+passend zum Sketch `ESP-BME.ino` (Thread + CoAP).
+
+## Board-Spezifisch
+
+Der Waveshare ESP32-H2-Zero führt 19 nutzbare GPIOs auf zwei einseitigen
+Stiftleisten heraus. Alle benötigten Pins dieses Projekts liegen auf der
+**linken Kopfzeile**:
+
+```text
+3V3   [1]            [1]  5V
+GND   [2]            [2]  GND
+GPIO0 [3]            [3]  GPIO11
+GPIO1 [4]  ESP32-H2  [4]  GPIO10   <- Anemometer
+GPIO2 [5]            [5]  GPIO9  (BOOT)
+GPIO3 [6]            [6]  GPIO8  (RGB-LED)
+GPIO4 [7]            [7]  GPIO22     <- BME280 SDA
+GPIO5 [8]            [8]  GPIO25     <- BME280 SCL
+GPIO12[9]            [9]  GPIO23 (UART RX)
+GPIO13[10]           [10] GPIO24 (UART TX)
+```
+
+- **Betriebsspannung strikt 3,3 V** — Pins sind nicht 5V-tolerant.
+- **GPIO8** ist fest mit der Onboard-WS2812B-LED verschaltet (im Projekt ungenutzt).
+- **GPIO9** liegt am BOOT-Taster (im Projekt ungenutzt).
+- **GPIO23/24** = UART0 (Serial-Debug), über USB-C erreichbar.
+- **ADC0–ADC5** = analog lesbar; **ADC1_CH0 = GPIO1** für den Anemometer.
 
 ## Pin-Zuordnung
 
@@ -20,8 +45,8 @@ Verdrahtung der Sensoren an den ESP32-H2 (ESP32-H2FH4S), passend zum Sketch
 
 ## Stromversorgung
 
-- ESP32-H2 über USB-C oder 5V/GND versorgt (DevKitM-1: 5V-Pin, alternativ VBAT
-  mit externer 3,3V-Quelle).
+- Waveshare ESP32-H2-Zero über **USB-C** (5V) versorgen; alternativ externes 5V
+  an den 5V-Pin `[1]` rechts. Die 3V3-Schiene liefert der Onboard-LDO.
 - **BME280:** 3,3V (VCC → 3V3, GND → GND). Nicht an 5V anschließen.
 - **Anemometer:** VCC → 3V3, GND → GND, Signal → GPIO1. Das analoge Ausgangssignal
   muss im Bereich **0–3,3V** liegen (bei 0–2,5V-Modellen direkt anschließbar; bei
@@ -34,20 +59,17 @@ Verdrahtung der Sensoren an den ESP32-H2 (ESP32-H2FH4S), passend zum Sketch
 ## Verdrahtungsplan (ASCII)
 
 ```
- ┌─────────────┐        ┌──────────────────────────────────────────────┐
- │  ESP32-H2   │        │            Wetter-Sensoren                   │
- │  (Modul)    │        │                                              │
- │             │  3V3 ──┼─► BME280 VCC           Anemometer VCC ──────► 3V3 rail
- │  GPIO4 ─────┼── SDA──┼──► BME280 SDA (4k7 Pull-up → 3V3, falls nötig)
- │  GPIO5 ─────┼── SCL──┼──► BME280 SCL (4k7 Pull-up → 3V3, falls nötig)
- │             │        │                                              │
- │  GPIO1 ─────┼────────┼──► Anemometer Signal (0–3,3V analog)         │
- │  (ADC1_CH0) │        │                                              │
- │             │        │                                              │
- │  GPIO12 ────┼────────┼──► Regenmesser Kontakt ──► GND              │
- │             │        │   (Reed-Schalter, schließt nach GND)         │
- │  GND    ────┼──► alle GND (BME280, Anemometer, Regenmesser) ────────┼─► GND rail
- └─────────────┘        └──────────────────────────────────────────────┘
+ ┌──────────────────┐        ┌──────────────────────────────────────────────┐
+ │  ESP32-H2-Zero   │        │            Wetter-Sensoren                   │
+ │  (linke Seite)   │        │                                              │
+ │  3V3 [1] ────────┼──► 3V3-Schiene: BME280 VCC, Anemometer VCC           │
+ │  GND  [2] ───────┼──► GND-Schiene: BME280, Anemometer, Regenmesser      │
+ │  GPIO4 [7] ─── SDA ────► BME280 SDA (4,7k → 3V3, falls nicht onboard)    │
+ │  GPIO5 [8] ─── SCL ────► BME280 SCL (4,7k → 3V3, falls nicht onboard)    │
+ │  GPIO1 [4] ────────────► Anemometer Signal (0–3,3V analog)               │
+ │  GPIO12[9] ────────────► Regenmesser Kontakt ──► GND (Reed, schließt      │
+ │                          nach GND, FALLING)                              │
+ └──────────────────┘        └──────────────────────────────────────────────┘
 ```
 
 ### Detaillierte Verbindungen
