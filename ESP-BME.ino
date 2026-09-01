@@ -31,6 +31,7 @@
 #define BME_ADDR 0x77      // BME280 antwortet auf 0x77 (statt Default 0x76)
 #define ANEMOMETER 1 // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
 #define INTERRUPT_PIN 12    // Regenmesser (Tipping Bucket), Interrupt
+#define LED_PIN 8           // Onboard-WS2812B (RGB-LED) - wird beim Start ausgeschaltet
 
 // Abtastung
 #define SAMPLING_COUNT 10
@@ -43,16 +44,15 @@
 // --------------------------------------------------------------------------
 // Thread-Netzkonfiguration (Operational Dataset)
 //
-// WICHTIG: Trage hier die Werte deines Thread-Netzwerks ein. Diese bekommst du
-// vom Thread Border Router (z. B. Home Assistant -> Thread-Integration:
-// Network Name, PAN ID, Channel, Extended PAN ID, Network Key).
+// Dieses Gerät tritt dem vom ESP-ThreadReceiver (Leader, ESP32-C6) geformten
+// Thread-Netzwerk bei. Die Werte sind identisch zu ESP-ThreadReceiver.ino.
 // --------------------------------------------------------------------------
-static const char    THREAD_NETWORK_NAME[] = "OpenThread-XXXX";      // z. B. "OpenThread-demo"
-static const uint16_t THREAD_PAN_ID        = 0x1234;                 // PAN ID deines Netzes
-static const uint8_t  THREAD_CHANNEL       = 15;                     // Kanal (11..26)
-static const uint8_t  THREAD_EXT_PAN_ID[8] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
-static const uint8_t  THREAD_NETWORK_KEY[16] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-                                                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+static const char    THREAD_NETWORK_NAME[] = "Wetter-Thread";
+static const uint16_t THREAD_PAN_ID        = 0x2345;
+static const uint8_t  THREAD_CHANNEL       = 15;
+static const uint8_t  THREAD_EXT_PAN_ID[8] = {0xDE,0xAD,0xBE,0xEF,0x00,0x00,0x01,0x02};
+static const uint8_t  THREAD_NETWORK_KEY[16] = {0xA1,0xB2,0xC3,0xD4,0xE5,0xF6,0x07,0x18,
+                                                0x29,0x3A,0x4B,0x5C,0x6D,0x7E,0x8F,0x90};
 
 // --------------------------------------------------------------------------
 // Globale (letzte) Messwerte - werden von loop() aktualisiert und von den
@@ -161,16 +161,20 @@ static void handleAll(OThreadCoAPRequest &req, OThreadCoAPResponse &resp, void *
 }
 
 // --------------------------------------------------------------------------
-// Thread-Netz beitreten (Dataset-basiert)
+// Thread-Netz beitreten (Joiner, nur Network Key)
+//
+// WICHTIG: Dieses Gerät ist ein JOINER. Es setzt ausschließlich den Network
+// Key - Channel, PAN ID und Extended PAN ID lernt es beim Attach vom Leader
+// (ESP-ThreadReceiver / ESP32-C6). Werden hier zusätzlich feste Werte gesetzt
+// und der Knoten findet das Leader-Netz nicht sofort, formt er eine EIGENE
+// Thread-Partition (eigenes Mesh-Local-Prefix) -> die CoAP-Abfragen des
+// Receivers timeouten. Vgl. offizielles Muster "RouterNode" / "sensor_client".
 // --------------------------------------------------------------------------
 static bool joinNetwork() {
   OThread.begin(false);  // kein Auto-Start; wir konfigurieren das Dataset selbst
 
   DataSet ds;
-  ds.setNetworkName(THREAD_NETWORK_NAME);
-  ds.setPanId(THREAD_PAN_ID);
-  ds.setChannel(THREAD_CHANNEL);
-  ds.setExtendedPanId(THREAD_EXT_PAN_ID);
+  ds.clear();
   ds.setNetworkKey(THREAD_NETWORK_KEY);
 
   OThread.commitDataSet(ds);
@@ -181,7 +185,7 @@ static bool joinNetwork() {
   Serial.print("Warte auf Thread-Verbindung");
   uint32_t start = millis();
   while (OThread.otGetDeviceRole() < OT_ROLE_CHILD) {
-    if (millis() - start > 30000) {
+    if (millis() - start > 60000) {
       Serial.println("\nTimeout - keine Thread-Verbindung.");
       return false;
     }
@@ -192,6 +196,8 @@ static bool joinNetwork() {
 
   Serial.printf("Verbunden als %s\n", OThread.otGetStringDeviceRole());
   OThread.otPrintNetworkInformation(Serial);
+  // Mesh-Local EID für den ESP-ThreadReceiver (nodes[] im Receiver-Sketch)
+  Serial.printf("Mesh-Local EID: %s\n", OThread.getMeshLocalEid().toString().c_str());
   return true;
 }
 
@@ -221,6 +227,10 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("=== ESP-BME: Thread + CoAP ===");
+
+  // Onboard-WS2812B-LED abschalten (GPIO8, im Projekt ungenutzt)
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   // I2C für BME280 (Pins/Adresse laut Schaltplan realer Verdrahtung)
   pinMode(I2C_SDA, INPUT_PULLUP);
@@ -257,34 +267,51 @@ void setup() {
 }
 
 // --------------------------------------------------------------------------
+// Gemittelte Messwerte in einer uebersichtlichen Tabelle auf dem Terminal
+// ausgeben (ASCII-only wg. Serial-Konsistenz).
+// --------------------------------------------------------------------------
+static void printValues(const bme280Struct *v, float rain) {
+  uint32_t ms = millis();
+  uint32_t h = ms / 3600000UL;
+  uint32_t m = (ms / 60000UL) % 60;
+  uint32_t s = (ms / 1000UL) % 60;
+
+  Serial.println();
+  Serial.println("+-------------------+------------------+");
+  Serial.printf  ("| Laufzeit          | %02lu:%02lu:%02lu          |\n", h, m, s);
+  Serial.println("+-------------------+------------------+");
+  Serial.printf  ("| Temperatur        | %6.2f C        |\n", v->t);
+  Serial.printf  ("| Luftdruck         | %7.2f hPa     |\n", v->p);
+  Serial.printf  ("| Hoehe (barometr.) | %7.2f m       |\n", v->alt);
+  Serial.printf  ("| Luftfeuchte       | %6.2f %        |\n", v->hum);
+  Serial.printf  ("| Windgeschwindigkeit| %5.2f m/s     |\n", v->wSpeed);
+  Serial.printf  ("| Regen (kumulativ) | %7.2f mm      |\n", rain);
+  Serial.println("+-------------------+------------------+");
+}
+
+// --------------------------------------------------------------------------
 void loop() {
   static uint32_t lastReport = 0;
 
-  // Nur senden/sampeln, wenn Thread verbunden ist
-  if (OThread.otGetDeviceRole() >= OT_ROLE_CHILD) {
-    uint32_t now = millis();
-    if (now - lastReport >= REPORT_INTERVAL_MS) {
-      lastReport = now;
+  uint32_t now = millis();
+  if (now - lastReport >= REPORT_INTERVAL_MS) {
+    lastReport = now;
 
-      sampleData(&meanVals);
-      g_temp = (float)meanVals.t;
-      g_press = (float)meanVals.p;
-      g_hum = (float)meanVals.hum;
-      g_wind = (float)meanVals.wSpeed;
+    sampleData(&meanVals);
+    g_temp = (float)meanVals.t;
+    g_press = (float)meanVals.p;
+    g_hum = (float)meanVals.hum;
+    g_wind = (float)meanVals.wSpeed;
 
-      // Regen-Ticks abtragen und kumulieren
-      uint32_t ticks = 0;
-      noInterrupts();
-      ticks = rainTicks;
-      rainTicks = 0;
-      interrupts();
-      g_rain += ticks * RAIN_MM_PER_TIP;
+    // Regen-Ticks abtragen und kumulieren
+    uint32_t ticks = 0;
+    noInterrupts();
+    ticks = rainTicks;
+    rainTicks = 0;
+    interrupts();
+    g_rain += ticks * RAIN_MM_PER_TIP;
 
-      Serial.printf("T %.2f | P %.2f | H %.2f | Alt %.2f | Wind %.2f m/s | Regen %.2f mm\n",
-                    meanVals.t, meanVals.p, meanVals.hum, meanVals.alt, meanVals.wSpeed, (double)g_rain);
-    }
-  } else {
-    delay(500);
+    printValues(&meanVals, g_rain);
   }
 
   delay(50);
