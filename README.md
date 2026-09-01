@@ -1,25 +1,22 @@
-# ESP-BME — Weather station über Matter over Thread
+# ESP-BME — Wetterstation über Thread + CoAP
 
 Kompakte Wetterstation auf Basis eines **ESP32-H2** (ESP32-H2FH4S, 96 MHz, 4 MB Flash,
-802.15.4/Thread + BLE 5), die Umgebungsdaten als **Matter over Thread**-Device
-publiziert. Der Fokus liegt auf möglichst sparsamem Betrieb (Thread Sleepy End Device
-+ Light Sleep).
+802.15.4/Thread + BLE 5), die Umgebungsdaten über ein Thread-Netzwerk per **CoAP**
+publiziert. Der Thread Border Router (OTBR) im lokalen Netz empfängt die Daten und
+leitet sie weiter (z. B. in eine Datenbank).
 
 ## Sensoren / Messgrößen
 
-| Messgröße | Sensor | Matter-Abbildung |
-|-----------|--------|------------------|
-| Temperatur | BME280 (I²C) | Standard-Endpoint `MatterTemperatureSensor` |
-| Luftfeuchte | BME280 (I²C) | Standard-Endpoint `MatterHumiditySensor` |
-| Luftdruck | BME280 (I²C) | Standard-Endpoint `MatterPressureSensor` |
-| Windgeschwindigkeit | Anemometer (ADC1_CH0) | Vendor Custom Cluster (`0x131BFC01`, Attribut `0x0000`, Wert = m/s · 10) |
-| Regenmenge | Regenmesser (Interrupt) | Vendor Custom Cluster (`0x131BFC01`, Attribut `0x0001`, Wert = mm · 10; 1 Kipp = 0,45 mm) |
+| Messgröße | Sensor | CoAP-Ressource |
+|-----------|--------|----------------|
+| Temperatur (°C) | BME280 (I²C) | `/weather/temp` |
+| Luftfeuchte (%) | BME280 (I²C) | `/weather/humidity` |
+| Luftdruck (hPa) | BME280 (I²C) | `/weather/pressure` |
+| Windgeschwindigkeit (m/s) | Anemometer (ADC1_CH0) | `/weather/all` (JSON) |
+| Regenmenge (mm, kumuliert) | Regenmesser (Interrupt) | `/weather/all` (JSON) |
 
-Matter bietet für **Windgeschwindigkeit** und **Regenmenge** keine standardisierten
-Endpoints, daher werden diese beiden Messgrößen über einen herstellerspezifischen
-Custom Cluster bereitgestellt (Vendor-ID `0x131B` = Espressif-Test-VID). Temperatur,
-Luftfeuchte und Druck verwenden die standardisierten Matter-Sensor-Endpoints und sind
-damit direkt in beliebigen Matter-Ökosystemen lesbar.
+Ein kombinierter JSON-Endpoint `/weather/all` liefert alle fünf Messgrößen in einem
+GET (idealer Endpoint für einen DB-Schreiber ert über dem OTBR).
 
 ## Pinbelegung
 
@@ -38,72 +35,82 @@ damit direkt in beliebigen Matter-Ökosystemen lesbar.
 
 ## Kommunikationsarchitektur
 
-Dieses Projekt ist als **ESP-IDF-Projekt mit dem Arduino Core als Komponente**
-aufgebaut (das offizielle Espressif-Muster für Matter over Thread auf ESP32-H2,
-analog zu `Arduino_ESP_Matter_over_OpenThread`). Grund: Herstellerspezifische Custom
-Clusters und der Sleepy-End-Device-/Light-Sleep-Betrieb erfordern Zugriff auf die
-ESP-IDF-Konfiguration (sdkconfig) und die esp-matter Low-Level-API. Der nutzbare
-Code bleibt dennoch ein gewöhnlicher Arduino-Matter-Sketch (`#include <Matter.h>`).
+Dieses Projekt ist ein **reiner Arduino-IDE-Sketch** (`ESP-BME.ino`) mit dem
+offiziellen OpenThread-Arduino-Paket von Espressif:
 
-- **Commissioning** erfolgt über BLE (Manual Pairing Code / QR-Code) in ein
-  Thread-Netzwerk.
-- Nach dem Commissioning läuft das Gerät als **Thread Sleepy End Device** (MTD) mit
-  Light Sleep → sehr geringer Stromverbrauch zwischen den Daten-Polls.
+- **Thread** — der Node tritt einem Thread-Netzwerk bei (typischerweise dem vom
+  Thread Border Router geformten Netz) und bekommt eine IPv6-Adresse (Thread-EID).
+- **CoAP (Server)** — der Node stellt die Messwerte als CoAP-Ressourcen auf
+  `udp/5683` bereit. Das Backend (erreichbar über den OTBR) liest sie per
+  `coap-client` bzw. einem beliebigen CoAP-Poll.
 
-### Benötigte Umgebung für Matter over Thread
+Die Übertragung erfolgt ausschließlich innerhalb des Thread-Mesh; der OTBR ist nur
+eine Brücke ins IP-Netz — er verarbeitet keine Daten, sondern macht die CoAP-Ressource
+des Nodes von außen erreichbar.
 
-- **Thread Border Router** im lokalen Netz (z. B. Home Assistant mit
-  Thread-Border-Router-Add-on) und ein **Matter-Controller** (z. B. Home Assistant,
-  Apple Home, Google Home), um das Gerät zu commissen und die Messwerte auszulesen.
-- Ohne Thread-Netzwerk zeigt das Gerät zunächst nur den Pairing-Code an und wartet
-  auf Commissioning (BLE).
+### Netzwerk-Topologie
 
-## Build & Flash (ESP-IDF)
+Der **Thread Border Router formt das Thread-Netz**. Der Node **tritt diesem Netz bei**.
+Das geschieht hier über ein **Operational Dataset** (Network Name, PAN ID, Channel,
+Extended PAN ID, Network Key) — die Werte des OTBR-Netzes müssen in `ESP-BME.ino`
+unter `THREAD_*` eingetragen werden. Alternativ steht das Kommissionieren per
+**Joiner/PSKd** (OpenThread `startJoiner`) zur Verfügung.
 
-Voraussetzungen: ESP-IDF (z. B. v5.5+) und eine Internetverbindung zum Laden der
-Komponenten (esp_matter, arduino-esp32) über den Komponenten-Registry.
+> **Wichtig:** Ein Thread-Node ist (bewusst) **nicht von außen über Wi-Fi/IP
+> erreichbar** — nur über einen Thread-Server bzw. den Border Router. Für reine
+> „fire-and-forget“-Datenübertragung über das lokale WLAN wäre ein Wi-Fi-Gerät
+> (z. B. ESP32) die einfachere Wahl.
+
+## Benötigte Umgebung
+
+- **Arduino IDE** (oder Arduino CLI) mit Board-Paket **esp32** (arduino-esp32 **v3.x**)
+  und **ESP32-H2** als Board.
+- Der Arduino-Core muss mit **OpenThread-Unterstützung** gebaut sein (Standard bei
+  ESP32-H2/C6/C5 in v3.x; ggf. per Boards-Manager-Option / sdkconfig True).
+- **Thread Border Router (OTBR)** im lokalen Netz (z. B. Home Assistant mit dem
+  Thread-Border-Router-Add-on) — er formt das Thread-Netz und stellt den Zugang ins
+  lokale Netz her.
+- Arduino-Bibliotheken: **Adafruit BME280 Library** und **Adafruit Unified Sensor**.
+
+## Build & Flash (Arduino IDE)
+
+1. Board **ESP32-H2** (z. B. `ESP32-H2 Dev Module`) und passenden Port wählen.
+2. `ESP-BME.ino` öffnen (alle Dateien liegen im Projektordner `ESP-BME/`).
+3. Unter `Thread-Netzkonfiguration` die `THREAD_*`-Werte deines Thread-Netzes eintragen
+   (vom OTBR, z. B. Home Assistant → Settings → Thread).
+4. Verifizieren und auf den ESP32-H2 flashen.
+
+### Kommandozeile (Arduino CLI, optional)
 
 ```bash
-# Projekt aus dem Repo, Ziel setzen (ESP32-H2), bauen, flashen, Seriell-Monitor
-idf.py set-target esp32h2
-idf.py build
-idf.py -p <COM-Port> flash monitor
+arduino-cli compile --fqbn esp32:esp32:esp32h2 ESP-BME
+arduino-cli upload  -p <COM-Port> --fqbn esp32:esp32:esp32h2 ESP-BME
 ```
 
-Beim ersten Build werden die deklarierten Komponenten aus
-`main/idf_component.yml` heruntergeladen. Die Versionsangaben dort sollten zur
-installierten ESP-IDF passen (siehe Freigabedaten von `arduino-esp32`).
+## Ablauf in der Praxis
 
-## Commissioning in ein Thread-Netzwerk
-
-1. Firmware flashen und Seriell-Monitor öffnen (115200 baud).
-2. Den angezeigten **Manual Pairing Code** bzw. die **QR-Code-URL** notieren.
-3. Im Matter-Controller (z. B. Home Assistant → Settings → Devices → Add Device,
-   „Matter“) das Gerät hinzufügen und den Code bzw. QR-Code eingeben.
-4. Nach erfolgreichem Commissioning verbindet sich das Gerät über Thread und wird
-   als Sleepy End Device betrieben.
-5. Temperatur, Feuchte und Druck erscheinen als eigene Sensoren; Wind & Regen sind
-   über den Custom Cluster auslesbar (z. B. mit dem CHIP-Tool).
+1. Firmware flashen, Seriell-Monitor (115200 baud) öffnen.
+2. Seriell-Log zeigt den Thread-Beitritt und die Netzwerkinformationen.
+3. Den Thread-EID/RLOC des Nodes notieren.
+4. Vom Backend (über den OTBR erreichbar) die CoAP-Ressourcen pollen, z. B. mit
+   `coap-client` aus dem Thread-Server/Gateway-Netzwerk:
+   ```bash
+   coap-client -m get coap://[<thread-eid>]/weather/all
+   ```
 
 ## Energiesparen
 
-- Thread-Clients nutzen Timer-basierte Polls; der 802.15.4-Radio ist zwischen den
-  Polls abgeschaltet (Sleepy End Device).
-- `CONFIG_PM_ENABLE` + `light_sleep_enable` lassen die CPU im Leerlauf schlafen.
-- Für Batteriebetrieb können `THREAD_POLL_INTERVAL_MS` und die Abtastrate
-  (`SAMPLING_COUNT`/`SAMPLING_DELAY`) erhöht werden.
-
-## Factory Reset / Decommissioning
-
-Eine erneute Inbetriebnahme wird durch ein Decommissioning in der Matter-Umgebung
-bzw. das Löschen des NVS erreicht:
-
-```bash
-idf.py -p <COM-Port> erase-flash
-```
+- Zwischen den Abtast-/Report-Zyklen bleibt die CPU im Leerlauf (Standard-Light-Sleep
+  von arduino-esp32 unter Thread).
+- Für Batteriebetrieb `REPORT_INTERVAL_MS` und `SAMPLING_COUNT`/`SAMPLING_DELAY`
+  erhöhen (weniger Radio-Aktivität).
+- Hinweis: Ein **Sleepy End Device (SED)**-Betrieb mit minimalem Stromverbrauch
+  erfordert die OpenThread-Konfiguration des Cores (Poll-Period u. Ä.) und ist hier
+  bewusst einfach gehalten.
 
 ## Geschichte
 
-Der Code wurde von einer ESP-NOW-Lösung („fire-and-forget“) auf **Matter over
-Thread** portiert und dabei optimiert (Sleepy End Device, Light Sleep, reduzierte
-Log-Platform).
+Der Code wurde von einer ESP-NOW-Lösung („fire-and-forget“) über **Matter over
+Thread** (eigener Zweig) schließlich zur einheitlichen, reinen **Thread + CoAP**-Variante
+portiert — Matter (mit Custom Cluster + ESP-IDF-Build) war für einen reinen Sensorknoten,
+der nur Daten senden soll, überdimensioniert.
