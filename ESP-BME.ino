@@ -20,6 +20,7 @@
 #include <Adafruit_BME280.h>
 #include <OThread.h>
 #include <OThreadCoAP.h>
+#include "SensorStruct.h"
 
 // --------------------------------------------------------------------------
 // Hardware-Konfiguration
@@ -70,30 +71,50 @@ Adafruit_BME280 bme;
 
 static volatile uint32_t rainTicks = 0;  // vom ISR erhöht, in loop() abgetragen
 
+static bme280Struct meanVals;  // zuletzt gemittelte Messwerte (T, P, Alt, Hum, Wind)
+
 IRAM_ATTR void rainSensorInterrupt() {
   rainTicks++;
 }
 
 // --------------------------------------------------------------------------
-// Einen Messwert abtasten (BME280 + Anemometer) und mitteln
+// Einzelnen Messwert vom BME280 + Anemometer lesen
 // --------------------------------------------------------------------------
-static void sampleAndAverage(float *t, float *p, float *h, float *w) {
-  float st = 0, sp = 0, sh = 0, sw = 0;
+static void readSensors(Adafruit_BME280 *sens, bme280Struct *vals) {
+  vals->t = sens->readTemperature();
+  vals->p = sens->readPressure() / 100.0F;
+  vals->alt = sens->readAltitude(SEALEVELPRESSURE_HPA);
+  vals->hum = sens->readHumidity();
+
+  double v = analogRead(ANEMOMETER);
+  // ESP32-H2: 12-bit ADC (0-4095), 3.3V Referenz, Vollbereich = 25 m/s
+  vals->wSpeed = (v / 4095.0) * 3.3 * 25;
+}
+
+// --------------------------------------------------------------------------
+// SAMPLING_COUNT-Werte sammeln und mitteln
+// --------------------------------------------------------------------------
+static void sampleData(bme280Struct *mean) {
+  mean->t = 0; mean->p = 0; mean->alt = 0; mean->hum = 0; mean->wSpeed = 0;
+
+  bme280Struct sensorVals[SAMPLING_COUNT];
   for (int i = 0; i < SAMPLING_COUNT; i++) {
-    st += bme.readTemperature();
-    sp += bme.readPressure() / 100.0F;
-    sh += bme.readHumidity();
-
-    double v = analogRead(ANEMOMETER);
-    // ESP32-H2: 12-bit ADC (0-4095), 3.3V Referenz, Vollbereich = 25 m/s
-    sw += (float)((v / 4095.0) * 3.3 * 25);
-
+    readSensors(&bme, &sensorVals[i]);
     delay(SAMPLING_DELAY);
   }
-  *t = st / SAMPLING_COUNT;
-  *p = sp / SAMPLING_COUNT;
-  *h = sh / SAMPLING_COUNT;
-  *w = sw / SAMPLING_COUNT;
+
+  for (int i = 0; i < SAMPLING_COUNT; i++) {
+    mean->t += sensorVals[i].t;
+    mean->p += sensorVals[i].p;
+    mean->alt += sensorVals[i].alt;
+    mean->hum += sensorVals[i].hum;
+    mean->wSpeed += sensorVals[i].wSpeed;
+  }
+  mean->t /= SAMPLING_COUNT;
+  mean->p /= SAMPLING_COUNT;
+  mean->alt /= SAMPLING_COUNT;
+  mean->hum /= SAMPLING_COUNT;
+  mean->wSpeed /= SAMPLING_COUNT;
 }
 
 // --------------------------------------------------------------------------
@@ -220,12 +241,11 @@ void loop() {
     if (now - lastReport >= REPORT_INTERVAL_MS) {
       lastReport = now;
 
-      float t, p, h, w;
-      sampleAndAverage(&t, &p, &h, &w);
-      g_temp = t;
-      g_press = p;
-      g_hum = h;
-      g_wind = w;
+      sampleData(&meanVals);
+      g_temp = (float)meanVals.t;
+      g_press = (float)meanVals.p;
+      g_hum = (float)meanVals.hum;
+      g_wind = (float)meanVals.wSpeed;
 
       // Regen-Ticks abtragen und kumulieren
       uint32_t ticks = 0;
@@ -235,8 +255,8 @@ void loop() {
       interrupts();
       g_rain += ticks * RAIN_MM_PER_TIP;
 
-      Serial.printf("T %.2f | P %.2f | H %.2f | Wind %.2f m/s | Regen %.2f mm\n",
-                    (double)t, (double)p, (double)h, (double)w, (double)g_rain);
+      Serial.printf("T %.2f | P %.2f | H %.2f | Alt %.2f | Wind %.2f m/s | Regen %.2f mm\n",
+                    meanVals.t, meanVals.p, meanVals.hum, meanVals.alt, meanVals.wSpeed, (double)g_rain);
     }
   } else {
     delay(500);
