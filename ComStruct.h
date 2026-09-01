@@ -1,8 +1,8 @@
 #ifndef COMSTRUCT_H_
 #define COMSTRUCT_H_
 /**
-* Type definition for esp-now communication (use in sender and receiver)
-*/
+ * Type definition for esp-now communication (use in sender and receiver)
+ */
 typedef struct {
   int datapointID; //group values to one datapoint
   char id[50];          //sensor id
