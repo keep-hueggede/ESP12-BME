@@ -68,6 +68,7 @@ static const char *TAG = "esp-bme";
 
 static attribute_t *windSpeedAttr = nullptr;
 static attribute_t *rainAmountAttr = nullptr;
+static uint16_t weatherEndpointId = 0;  // endpoint hosting the custom cluster
 static volatile uint32_t rainTicks = 0;  // read from ISR, drained in loop()
 
 // --------------------------------------------------------------------------
@@ -97,7 +98,12 @@ IRAM_ATTR void rainSensorInterrupt() {
 static void createWeatherCustomCluster() {
   node_t *rootNode = node::get();
 
-  endpoint_t *weatherEp = endpoint::create(rootNode, ENDPOINT_FLAG_NONE);
+  endpoint_t *weatherEp = endpoint::create(rootNode, ENDPOINT_FLAG_NONE, nullptr);
+  if (weatherEp == nullptr) {
+    ESP_LOGE(TAG, "Failed to create weather endpoint");
+    return;
+  }
+  weatherEndpointId = endpoint::get_id(weatherEp);
 
   cluster_t *cluster = cluster::create(weatherEp, CUSTOM_CLUSTER_ID, CLUSTER_FLAG_SERVER);
   if (cluster == nullptr) {
@@ -108,18 +114,18 @@ static void createWeatherCustomCluster() {
   windSpeedAttr = attribute::create(cluster, ATTR_WIND_SPEED, AMBIENT_ATTR_FLAGS, esp_matter_uint16(0));
   rainAmountAttr = attribute::create(cluster, ATTR_RAIN_AMOUNT, AMBIENT_ATTR_FLAGS, esp_matter_uint16(0));
 
-  ESP_LOGI(TAG, "Weather custom cluster created (ep=%" PRIu16 ")", endpoint::get_id(weatherEp));
+  ESP_LOGI(TAG, "Weather custom cluster created (ep=%u)", weatherEndpointId);
 }
 
 /**
  * Publish a uint16 attribute of the weather custom cluster.
  */
-static void setWeatherAttribute(attribute_t *attr, uint16_t value) {
-  if (attr == nullptr) {
+static void setWeatherAttribute(uint32_t attributeId, uint16_t value) {
+  if (weatherEndpointId == 0 || windSpeedAttr == nullptr || rainAmountAttr == nullptr) {
     return;
   }
   esp_matter_attr_val_t val = esp_matter_uint16(value);
-  attribute::update(attr->cluster, attribute::get_id(attr), &val);
+  attribute::update(weatherEndpointId, CUSTOM_CLUSTER_ID, attributeId, &val);
 }
 
 /**
@@ -159,7 +165,7 @@ static void sampleAndAverage(float *t, float *p, float *h, float *w) {
  * Enable light sleep so the CPU sleeps between Thread polls (Sleepy End Device).
  */
 static void enableLightSleep() {
-  esp_pm_config_esp32h2_t pmConfig = {
+  esp_pm_config_t pmConfig = {
       .max_freq_mhz = 96,   // ESP32-H2 top frequency
       .min_freq_mhz = 32,   // low power clock available for light sleep
       .light_sleep_enable = true,
@@ -250,7 +256,7 @@ void loop() {
 
   // Custom cluster: wind (m/s * 10) and accumulated rain (mm * 10)
   uint16_t windX10 = (uint16_t)(wind * 10.0f + 0.5f);
-  setWeatherAttribute(windSpeedAttr, windX10);
+  setWeatherAttribute(ATTR_WIND_SPEED, windX10);
 
   // Drain rain ticks accumulated since last cycle
   uint32_t ticks = 0;
@@ -262,7 +268,7 @@ void loop() {
   }
   static uint32_t accumulatedRainMM10 = 0;
   accumulatedRainMM10 += (uint16_t)(ticks * RAIN_MM_PER_TIP * 10.0f);
-  setWeatherAttribute(rainAmountAttr, accumulatedRainMM10);
+  setWeatherAttribute(ATTR_RAIN_AMOUNT, accumulatedRainMM10);
 
   ESP_LOGI(TAG, "T %.1f C | H %.1f %% | P %.1f hPa | Wind %.1f m/s | Rain %.1f mm",
            temp, hum, press, wind, (float)accumulatedRainMM10 / 10.0f);
