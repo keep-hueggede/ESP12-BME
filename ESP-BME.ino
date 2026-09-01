@@ -26,8 +26,9 @@
 // Hardware-Konfiguration
 // --------------------------------------------------------------------------
 #define SEALEVELPRESSURE_HPA (1013.25)
-#define I2C_SDA 4          // ESP32-H2: GPIO4 (SDA)
-#define I2C_SCL 5          // ESP32-H2: GPIO5 (SCL)
+#define I2C_SDA 5          // BME280 real an GPIO5 (SDA), ermittelt per Bus-Scan
+#define I2C_SCL 4          // BME280 real an GPIO4 (SCL), ermittelt per Bus-Scan
+#define BME_ADDR 0x77      // BME280 antwortet auf 0x77 (statt Default 0x76)
 #define ANEMOMETER 1 // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
 #define INTERRUPT_PIN 12    // Regenmesser (Tipping Bucket), Interrupt
 
@@ -195,7 +196,7 @@ static bool joinNetwork() {
 }
 
 // --------------------------------------------------------------------------
-// I²C-Bus scannen und gefundene Adressen ausgeben (Diagnose)
+// I²C-Bus scannen und gefundene Adressen ausgeben (Diagnose im Fehlerfall)
 // --------------------------------------------------------------------------
 static void scanI2C() {
   Serial.println("I²C-Scan (SDA=" + String(I2C_SDA) + ", SCL=" + String(I2C_SCL) + "):");
@@ -221,7 +222,9 @@ void setup() {
   delay(500);
   Serial.println("=== ESP-BME: Thread + CoAP ===");
 
-  // I2C für BME280
+  // I2C für BME280 (Pins/Adresse laut Schaltplan realer Verdrahtung)
+  pinMode(I2C_SDA, INPUT_PULLUP);
+  pinMode(I2C_SCL, INPUT_PULLUP);
   I2CBME.begin(I2C_SDA, I2C_SCL, 100000);
 
   // Regenmesser (hardware-entprellter Tipping Bucket)
@@ -229,7 +232,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), rainSensorInterrupt, FALLING);
 
   // BME280
-  if (!bme.begin(0x76, &I2CBME)) {
+  if (!bme.begin(BME_ADDR, &I2CBME)) {
     Serial.println("BME280 nicht gefunden, verdrahtung prüfen!");
     scanI2C();
     while (1) delay(1000);

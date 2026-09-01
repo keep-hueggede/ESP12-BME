@@ -16,8 +16,8 @@ GPIO0 [3]            [3]  GPIO11
 GPIO1 [4]  ESP32-H2  [4]  GPIO10   <- Anemometer
 GPIO2 [5]            [5]  GPIO9  (BOOT)
 GPIO3 [6]            [6]  GPIO8  (RGB-LED)
-GPIO4 [7]            [7]  GPIO22     <- BME280 SDA
-GPIO5 [8]            [8]  GPIO25     <- BME280 SCL
+GPIO4 [7]            [7]  GPIO22     <- BME280 SCL
+GPIO5 [8]            [8]  GPIO25     <- BME280 SDA
 GPIO12[9]            [9]  GPIO23 (UART RX)
 GPIO13[10]           [10] GPIO24 (UART TX)
 ```
@@ -32,8 +32,8 @@ GPIO13[10]           [10] GPIO24 (UART TX)
 
 | Funktion        | ESP32-H2 Pin | Sensor/Anschluss                                      |
 |-----------------|--------------|-------------------------------------------------------|
-| I²C SDA         | GPIO4        | BME280 SDA (Pull-up 4,7k gegen 3V3, falls nicht onboard) |
-| I²C SCL         | GPIO5        | BME280 SCL (Pull-up 4,7k gegen 3V3, falls nicht onboard) |
+| I²C SDA         | GPIO5        | BME280 SDA (Pull-up 4,7k gegen 3V3, falls nicht onboard) |
+| I²C SCL         | GPIO4        | BME280 SCL (Pull-up 4,7k gegen 3V3, falls nicht onboard) |
 | Anemometer (Analog) | **GPIO1** (ADC1_CH0) | Anemometer Signal (0–3,3V) |
 | Regenmesser (Interrupt) | GPIO12      | Regenmesser Kontakt (schließt nach GND, FALLING)     |
 | Masse           | GND          | gemeinsame Masse aller Sensoren                       |
@@ -65,8 +65,8 @@ GPIO13[10]           [10] GPIO24 (UART TX)
  │  (linke Seite)   │        │                                              │
  │  3V3 [1] ────────┼──► 3V3-Schiene: BME280 VCC, Anemometer VCC           │
  │  GND  [2] ───────┼──► GND-Schiene: BME280, Anemometer, Regenmesser      │
- │  GPIO4 [7] ─── SDA ────► BME280 SDA (4,7k → 3V3, falls nicht onboard)    │
- │  GPIO5 [8] ─── SCL ────► BME280 SCL (4,7k → 3V3, falls nicht onboard)    │
+ │  GPIO4 [7] ─── SCL ────► BME280 SCL (4,7k → 3V3, falls nicht onboard)    │
+ │  GPIO5 [8] ─── SDA ────► BME280 SDA (4,7k → 3V3, falls nicht onboard)    │
  │  GPIO1 [4] ────────────► Anemometer Signal (0–3,3V analog)               │
  │  GPIO12[9] ────────────► Regenmesser Kontakt ──► GND (Reed, schließt      │
  │                          nach GND, FALLING)                              │
@@ -81,15 +81,16 @@ GPIO13[10]           [10] GPIO24 (UART TX)
 | GND            | BME280 GND                    | schwarz |
 | GND            | Anemometer GND                | schwarz |
 | GND            | Regenmesser (ein Anschluss)   | schwarz |
-| GPIO4          | BME280 SDA                    | blau  |
-| GPIO5          | BME280 SCL                    | gelb  |
+| GPIO4          | BME280 SCL                    | gelb  |
+| GPIO5          | BME280 SDA                    | blau  |
 | GPIO1 (ADC1_CH0) | Anemometer Signal           | grün  |
 | GPIO12         | Regenmesser (anderer Anschluss) | weiß |
 
 ## Prüfwerte vor dem Start
 
-1. **BME280:** erwartete I²C-Adresse `0x76` (Schematics rechnen mit 0x76; bei
-   Adressierung über Jumper prüfen).
+1. **BME280:** dieses Modul antwortet auf I²C-Adresse `0x77` (SDO auf High). Der
+   Sketch nutzt `BME_ADDR` (`0x77`); bei Modulen mit SDO auf Low wäre es `0x76`.
+   Beide Adressen sind mit dem Multi-Pin-I²C-Scan ermittelt worden.
 2. **I²C Pull-ups:** Die meisten BME280-Breakouts haben 4,7k schon onboard. Wenn
    du das nackte Sensormodul verwendest: 4,7k von SDA nach 3V3 und von SCL nach
    3V3 löten.
