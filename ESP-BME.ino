@@ -1,25 +1,22 @@
 /******************************************
- * ESP-BME - Wetterstation über Thread + CoAP
+ * ESP-BME-LoRa - Wetterstation über LoRa
  *
- * ESP32-H2 (ESP32-H2FH4S) Wetterknoten, der Messwerte über ein
- * Thread-Netzwerk bereitstellt. Der Thread Border Router (OTBR) im
- * Netz empfängt die Daten und leitet sie weiter (z. B. in eine DB).
+ * ESP32-H2 (ESP32-H2FH4S) Wetterknoten für den Einsatz im Wald.
+ * Messwerte (BME280, Anemometer, Regen) werden periodisch per LoRa
+ * (SX1276/77/78/79, 868 MHz EU) an die zentrale Empfangsstation
+ * (ESP-ThreadReceiver mit LoRa-Modul) gesendet.
  *
- * Übertragung:    Thread (801.15.4) + CoAP (UDP, Port 5683)
- * Rolle:          CoAP-Server, stellt die Messwerte als Ressourcen bereit
- *                 (das Backend liest sie per CoAP-GET über den OTBR)
- * Kommissionierung: Node tritt dem vom OTBR geformten Thread-Netz mit
- *                 einem Operational Dataset bei (siehe THREAD_* unten).
+ * Übertragung:    LoRa (SPI, SX127x) @ 868 MHz, SF12 für maximale Reichweite
+ * Rolle:          LoRa-Sender (Waldknoten), sendet JSON-Pakete
  *
- * Benötigt den Arduino-Core (arduino-esp32 v3.x) mit OpenThread-Unterstützung
- * (ESP32-H2/C6/C5). OpenThread muss im Core-Build aktiviert sein.
+ * Benötigt: RadioLib (arduino-cli lib install RadioLib) und ein
+ * LoRa-Modul am SPI-Bus des ESP32-H2.
  *******************************************/
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
-#include <OThread.h>
-#include <OThreadCoAP.h>
+#include <RadioLib.h>
 #include "SensorStruct.h"
 
 // --------------------------------------------------------------------------
@@ -29,34 +26,47 @@
 #define I2C_SDA 5          // BME280 real an GPIO5 (SDA), ermittelt per Bus-Scan
 #define I2C_SCL 4          // BME280 real an GPIO4 (SCL), ermittelt per Bus-Scan
 #define BME_ADDR 0x77      // BME280 antwortet auf 0x77 (statt Default 0x76)
-#define ANEMOMETER 1 // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
-#define INTERRUPT_PIN 12    // Regenmesser (Tipping Bucket), Interrupt
-#define LED_PIN 8           // Onboard-WS2812B (RGB-LED) - wird beim Start ausgeschaltet
+#define ANEMOMETER 1       // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
+#define INTERRUPT_PIN 12   // Regenmesser (Tipping Bucket), Interrupt
+#define LED_PIN 8          // Onboard-WS2812B (RGB-LED) - wird beim Start ausgeschaltet
 
-// Abtastung
-#define SAMPLING_COUNT 10
-#define SAMPLING_DELAY 100
-#define REPORT_INTERVAL_MS 5000   // Intervall, in dem die Messwerte aktualisiert werden
+// LoRa-Modul am SPI-Bus des ESP32-H2 (Verdrahtung anpassen!)
+#define LORA_SS   0        // NSS/CS  -> GPIO0 (Default SS des H2)
+#define LORA_RST  2        // Reset   -> GPIO2 (frei)
+#define LORA_DIO0 3        // DIO0    -> GPIO3 (frei, optional für RX-Interrupts)
+// SCK=GPIO10, MOSI=GPIO25, MISO=GPIO11 (Default-SPI des H2)
+
+// Energieoptimierung: Takt reduzieren. 48 MHz spart Arbeitssstrom; der LoRa
+// Transceiver läuft unabhängig vom CPU-Takt.
+#define CPU_FREQ_MHZ 48
+
+// Abtastung: Wenige Samples reichen; je geringer, desto seltener muss die
+// CPU aufwachen und der BME messen.
+#define SAMPLING_COUNT 3
+#define SAMPLING_DELAY 5
+#define SEND_INTERVAL_MS 60000   // Sendeintervall im Wald (60 s; Batterie-freundlich)
 
 // Regenmesser: 1 Kippung = 0.45 mm
 #define RAIN_MM_PER_TIP 0.45
 
 // --------------------------------------------------------------------------
-// Thread-Netzkonfiguration (Operational Dataset)
-//
-// Dieses Gerät tritt dem vom ESP-ThreadReceiver (Leader, ESP32-C6) geformten
-// Thread-Netzwerk bei. Die Werte sind identisch zu ESP-ThreadReceiver.ino.
+// LoRa-Funkparameter (müssen auf Sender und Empfänger identisch sein!)
 // --------------------------------------------------------------------------
-static const char    THREAD_NETWORK_NAME[] = "Wetter-Thread";
-static const uint16_t THREAD_PAN_ID        = 0x2345;
-static const uint8_t  THREAD_CHANNEL       = 15;
-static const uint8_t  THREAD_EXT_PAN_ID[8] = {0xDE,0xAD,0xBE,0xEF,0x00,0x00,0x01,0x02};
-static const uint8_t  THREAD_NETWORK_KEY[16] = {0xA1,0xB2,0xC3,0xD4,0xE5,0xF6,0x07,0x18,
-                                                0x29,0x3A,0x4B,0x5C,0x6D,0x7E,0x8F,0x90};
+#define LORA_FREQ_MHZ   868.1F   // EU-LoRa ISM-Band, Kanal 1
+#define LORA_SF         12       // Spreading Factor 12 = maximale Reichweite
+#define LORA_BW         125.0F   // Bandbreite 125 kHz
+#define LORA_CR         8        // Coding Rate 4/8 (mehr Redundanz, bessere Link-Budget)
+#define LORA_SYNC       0x12     // Sync-Word (Standard LoRa)
+#define LORA_POWER      20       // Sendeleistung in dBm (max. ~20 bei SX127x PA_BOOST)
+#define LORA_PREAMBLE   8        // Preamble-Symbole
+#define LORA_TX_TIMEOUT 5000     // RadioLib-Timeout für einen Sendevorgang (ms)
+
+// Knotenbezeichnung (geht als Prefix ins LoRa-Paket, damit die Zentrale
+// mehrere Waldknoten unterscheiden kann)
+static const char NODE_NAME[] = "wetter1";
 
 // --------------------------------------------------------------------------
-// Globale (letzte) Messwerte - werden von loop() aktualisiert und von den
-// CoAP-Handlern gelesen.
+// Globale (letzte) Messwerte - werden von loop() aktualisiert
 // --------------------------------------------------------------------------
 static volatile float g_temp  = 0.0f;
 static volatile float g_press = 0.0f;  // hPa
@@ -65,10 +75,12 @@ static volatile float g_wind  = 0.0f;  // m/s
 static volatile float g_rain  = 0.0f;  // mm, kumuliert
 
 // --------------------------------------------------------------------------
-// Sensoren
+// Sensoren & Funk
 // --------------------------------------------------------------------------
 TwoWire I2CBME = TwoWire(0);
 Adafruit_BME280 bme;
+SX1278 radio = new Module((uint32_t)LORA_SS, (uint32_t)LORA_DIO0,
+                           (uint32_t)LORA_RST, (uint32_t)RADIOLIB_NC);
 
 static volatile uint32_t rainTicks = 0;  // vom ISR erhöht, in loop() abgetragen
 
@@ -80,8 +92,14 @@ IRAM_ATTR void rainSensorInterrupt() {
 
 // --------------------------------------------------------------------------
 // Einzelnen Messwert vom BME280 + Anemometer lesen
+//
+// Energiesparmodus: Der BME280 läuft im Forced-Mode. Er schläft dann zwischen
+// den Messungen (nur wenige µA) und nimmt auf takeForcedMeasurement() genau
+// eine Messung vor.
 // --------------------------------------------------------------------------
 static void readSensors(Adafruit_BME280 *sens, bme280Struct *vals) {
+  sens->takeForcedMeasurement();
+
   vals->t = sens->readTemperature();
   vals->p = sens->readPressure() / 100.0F;
   vals->alt = sens->readAltitude(SEALEVELPRESSURE_HPA);
@@ -119,7 +137,7 @@ static void sampleData(bme280Struct *mean) {
 }
 
 // --------------------------------------------------------------------------
-// CoAP-Ressourcen
+// JSON-Payload bauen (gleiches Format wie bisher vom CoAP-Server)
 // --------------------------------------------------------------------------
 static void buildJson(char *buf, size_t len) {
   snprintf(buf, len,
@@ -128,77 +146,43 @@ static void buildJson(char *buf, size_t len) {
            (double)g_temp, (double)g_press, (double)g_hum, (double)g_wind, (double)g_rain);
 }
 
-static void handleTemp(OThreadCoAPRequest &req, OThreadCoAPResponse &resp, void *ctx) {
-  char buf[24];
-  snprintf(buf, sizeof(buf), "%.2f", (double)g_temp);
-  resp.setContentFormat(OT_COAP_FORMAT_TEXT);
-  resp.setPayload(buf);
-  resp.send();
-}
-
-static void handlePressure(OThreadCoAPRequest &req, OThreadCoAPResponse &resp, void *ctx) {
-  char buf[24];
-  snprintf(buf, sizeof(buf), "%.2f", (double)g_press);
-  resp.setContentFormat(OT_COAP_FORMAT_TEXT);
-  resp.setPayload(buf);
-  resp.send();
-}
-
-static void handleHumidity(OThreadCoAPRequest &req, OThreadCoAPResponse &resp, void *ctx) {
-  char buf[24];
-  snprintf(buf, sizeof(buf), "%.2f", (double)g_hum);
-  resp.setContentFormat(OT_COAP_FORMAT_TEXT);
-  resp.setPayload(buf);
-  resp.send();
-}
-
-static void handleAll(OThreadCoAPRequest &req, OThreadCoAPResponse &resp, void *ctx) {
-  char buf[192];
-  buildJson(buf, sizeof(buf));
-  resp.setContentFormat(OT_COAP_FORMAT_JSON);
-  resp.setPayload(buf);
-  resp.send();
-}
-
 // --------------------------------------------------------------------------
-// Thread-Netz beitreten (Joiner, nur Network Key)
-//
-// WICHTIG: Dieses Gerät ist ein JOINER. Es setzt ausschließlich den Network
-// Key - Channel, PAN ID und Extended PAN ID lernt es beim Attach vom Leader
-// (ESP-ThreadReceiver / ESP32-C6). Werden hier zusätzlich feste Werte gesetzt
-// und der Knoten findet das Leader-Netz nicht sofort, formt er eine EIGENE
-// Thread-Partition (eigenes Mesh-Local-Prefix) -> die CoAP-Abfragen des
-// Receivers timeouten. Vgl. offizielles Muster "RouterNode" / "sensor_client".
+// LoRa am ESP32-H2 initialisieren
 // --------------------------------------------------------------------------
-static bool joinNetwork() {
-  OThread.begin(false);  // kein Auto-Start; wir konfigurieren das Dataset selbst
-
-  DataSet ds;
-  ds.clear();
-  ds.setNetworkKey(THREAD_NETWORK_KEY);
-
-  OThread.commitDataSet(ds);
-
-  OThread.networkInterfaceUp();
-  OThread.start();
-
-  Serial.print("Warte auf Thread-Verbindung");
-  uint32_t start = millis();
-  while (OThread.otGetDeviceRole() < OT_ROLE_CHILD) {
-    if (millis() - start > 60000) {
-      Serial.println("\nTimeout - keine Thread-Verbindung.");
-      return false;
-    }
-    Serial.print('.');
-    delay(200);
+static bool initLora() {
+  Serial.println("Initialisiere LoRa-Modul...");
+  int state = radio.begin(LORA_FREQ_MHZ, LORA_BW, LORA_SF, LORA_CR,
+                          LORA_SYNC, LORA_POWER, LORA_PREAMBLE, LORA_TX_TIMEOUT);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("LoRa-Fehler bei begin(): %d. Verdrahtung prüfen!\n", state);
+    return false;
   }
-  Serial.println();
 
-  Serial.printf("Verbunden als %s\n", OThread.otGetStringDeviceRole());
-  OThread.otPrintNetworkInformation(Serial);
-  // Mesh-Local EID für den ESP-ThreadReceiver (nodes[] im Receiver-Sketch)
-  Serial.printf("Mesh-Local EID: %s\n", OThread.getMeshLocalEid().toString().c_str());
+  Serial.printf("LoRa bereit: %.1f MHz, SF%d, BW%.0f kHz, CR 4/%d, +%d dBm\n",
+                LORA_FREQ_MHZ, (int)LORA_SF, LORA_BW, (int)LORA_CR, (int)LORA_POWER);
   return true;
+}
+
+// --------------------------------------------------------------------------
+// Aktuelle Messwerte per LoRa an die Zentrale senden.
+// Paketformat: "<Knotenname> <JSON>"
+// --------------------------------------------------------------------------
+static void sendLora() {
+  char json[192];
+  buildJson(json, sizeof(json));
+
+  char packet[192];
+  snprintf(packet, sizeof(packet), "%s %s", NODE_NAME, json);
+
+  Serial.printf("Sende: %s\n", packet);
+
+  int state = radio.transmit((const char *)packet);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.printf("Gesendet (%lu ms on-air).\n",
+                  (unsigned long)radio.getTimeOnAir(sizeof(packet)));
+  } else {
+    Serial.printf("Sendefehler: %d\n", state);
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -224,9 +208,15 @@ static void scanI2C() {
 
 // --------------------------------------------------------------------------
 void setup() {
+  // Energiesparmodus: Takt früh senken (vor I2C/ADC/Funk).
+  if (!setCpuFrequencyMhz(CPU_FREQ_MHZ)) {
+    Serial.println("CPU-Frequenz konnte nicht gesetzt werden!");
+  }
+
   Serial.begin(115200);
   delay(500);
-  Serial.println("=== ESP-BME: Thread + CoAP ===");
+  Serial.println("=== ESP-BME-LoRa: Waldknoten ===");
+  Serial.printf("CPU-Takt: %u MHz\n", (unsigned)getCpuFrequencyMhz());
 
   // Onboard-WS2812B-LED abschalten (GPIO8, im Projekt ungenutzt)
   pinMode(LED_PIN, OUTPUT);
@@ -248,22 +238,18 @@ void setup() {
     while (1) delay(1000);
   }
 
-  // Dem Thread-Netz beitreten
-  if (!joinNetwork()) {
-    Serial.println("Thread-Beitritt fehlgeschlagen. Bitte Dataset-Werte prüfen.");
+  // Energiesparmodus BME280: Forced-Mode + leichtes Oversampling.
+  bme.setSampling(Adafruit_BME280::MODE_FORCED,   // nur messen, wenn angefordert
+                  Adafruit_BME280::SAMPLING_X2,   // Temperatur
+                  Adafruit_BME280::SAMPLING_X1,   // Druck
+                  Adafruit_BME280::SAMPLING_X2,   // Feuchte
+                  Adafruit_BME280::FILTER_OFF,    // kein IIR-Filter (spart Umsetzung)
+                  Adafruit_BME280::STANDBY_MS_0_5);  // Standby (bei Forced irrelevant)
+
+  // LoRa-Modul starten
+  if (!initLora()) {
+    Serial.println("LoRa-Modul nicht erreichbar. Bitte Verdrahtung/Spannung prüfen.");
   }
-
-  // CoAP-Server starten und Ressourcen registrieren.
-  // Hinweis: OThreadCoAPServer fasst nur OT_COAP_MAX_RESOURCES (Default 4)
-  // Ressourcen. Wind/Regen werden daher nicht als einzelne Endpoints, sondern
-  // nur im JSON-Endpoint /weather/all angeboten.
-  OThreadCoAPServer.on("weather/temp",     OT_COAP_METHOD_GET, handleTemp,     nullptr);
-  OThreadCoAPServer.on("weather/pressure", OT_COAP_METHOD_GET, handlePressure, nullptr);
-  OThreadCoAPServer.on("weather/humidity", OT_COAP_METHOD_GET, handleHumidity, nullptr);
-  OThreadCoAPServer.on("weather/all",      OT_COAP_METHOD_GET, handleAll,      nullptr);
-  OThreadCoAPServer.begin();
-
-  Serial.println("CoAP-Server bereit. Ressourcen: /weather/temp, /weather/pressure, /weather/humidity, /weather/all (JSON)");
 }
 
 // --------------------------------------------------------------------------
@@ -291,11 +277,11 @@ static void printValues(const bme280Struct *v, float rain) {
 
 // --------------------------------------------------------------------------
 void loop() {
-  static uint32_t lastReport = 0;
+  static uint32_t lastSend = 0;
 
   uint32_t now = millis();
-  if (now - lastReport >= REPORT_INTERVAL_MS) {
-    lastReport = now;
+  if (now - lastSend >= SEND_INTERVAL_MS) {
+    lastSend = now;
 
     sampleData(&meanVals);
     g_temp = (float)meanVals.t;
@@ -312,6 +298,7 @@ void loop() {
     g_rain += ticks * RAIN_MM_PER_TIP;
 
     printValues(&meanVals, g_rain);
+    sendLora();
   }
 
   delay(50);
