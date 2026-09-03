@@ -161,23 +161,54 @@ static void handleAll(OThreadCoAPRequest &req, OThreadCoAPResponse &resp, void *
 }
 
 // --------------------------------------------------------------------------
-// Thread-Netz beitreten (Joiner, nur Network Key)
+// Thread-Netz beitreten
 //
-// WICHTIG: Dieses Gerät ist ein JOINER. Es setzt ausschließlich den Network
-// Key - Channel, PAN ID und Extended PAN ID lernt es beim Attach vom Leader
-// (ESP-ThreadReceiver / ESP32-C6). Werden hier zusätzlich feste Werte gesetzt
-// und der Knoten findet das Leader-Netz nicht sofort, formt er eine EIGENE
-// Thread-Partition (eigenes Mesh-Local-Prefix) -> die CoAP-Abfragen des
-// Receivers timeouten. Vgl. offizielles Muster "RouterNode" / "sensor_client".
+// Das Gerät provisioniert sich mit denselben Netzparametern wie der Receiver
+// (ESP32-C6) und tritt dessen Netz bei. Details und die Begründung für
+// initNew() stehen im Kommentar direkt an der Dataset-Erzeugung.
+//
+// OFFEN: Receiver und Sensor erzeugen je ein eigenes initNew()-Dataset und
+// damit je ein eigenes Mesh-Local-Prefix. Beide attachen zwar (gemeinsamer
+// Network Key), gleichen ihre Datasets aber nicht ab, weil
+// otDatasetCreateNewNetwork() beiden denselben Active Timestamp gibt.
+// CoAP zwischen den Knoten ist dadurch noch nicht routbar. Saubere Lösung
+// ist der Commissioner/Joiner-Pfad (startCommissioner/addJoiner auf dem
+// Leader, startJoiner hier), bei dem der Joiner das vollständige Dataset
+// des Leaders über die Luft erhält.
 // --------------------------------------------------------------------------
 static bool joinNetwork() {
   OThread.begin(false);  // kein Auto-Start; wir konfigurieren das Dataset selbst
 
-  DataSet ds;
-  ds.clear();
-  ds.setNetworkKey(THREAD_NETWORK_KEY);
+  // WICHTIG: otDatasetSetActive() lehnt ein Dataset OHNE Active Timestamp ab
+  // (OT_ERROR_INVALID_ARGS). Den Timestamp setzt nur initNew(); ein per
+  // clear() + Einzelfeldern gebautes Dataset wird still verworfen - der
+  // Fehler landet nur in log_e und ist ohne Core-Debug-Level unsichtbar.
+  // Der Knoten haette dann gar kein Active Dataset und kann nicht attachen.
+  //
+  // Deshalb: initNew() (setzt Timestamp, Mesh-Local-Prefix, PSKc) und danach
+  // die gemeinsamen Netzparameter ueberschreiben. Extended PAN ID, Key,
+  // Channel und PAN ID sind mit dem Leader identisch - die Partitionen
+  // verschmelzen, das Dataset mit dem hoeheren Timestamp gewinnt.
+  // Nur beim ersten Start; danach gilt das persistierte Dataset aus NVS.
+  if (!OThread.hasActiveDataset()) {
+    DataSet ds;
+    ds.initNew();
+    ds.setNetworkName(THREAD_NETWORK_NAME);
+    ds.setPanId(THREAD_PAN_ID);
+    ds.setChannel(THREAD_CHANNEL);
+    ds.setExtendedPanId(THREAD_EXT_PAN_ID);
+    ds.setNetworkKey(THREAD_NETWORK_KEY);
+    OThread.commitDataSet(ds);
+    Serial.println("Neues Dataset angelegt (initNew + Netzparameter).");
+  } else {
+    Serial.println("Wiederverwende gespeichertes Dataset aus NVS.");
+  }
 
-  OThread.commitDataSet(ds);
+  // Diagnose: was steht nach dem Commit wirklich im Active Dataset?
+  Serial.printf("Dataset: ActiveDs=%s Name=%s PAN=0x%04X Ch=%u\n",
+                OThread.hasActiveDataset() ? "ja" : "NEIN",
+                OThread.getNetworkName().c_str(),
+                (int)OThread.getPanId(), (int)OThread.getChannel());
 
   OThread.networkInterfaceUp();
   OThread.start();
