@@ -103,6 +103,7 @@ static const char SENSOR_NAME[] = "wetter1";
 static const char JOINER_PSKD[] = "WETTER01";
 #define JOINER_TIMEOUT_MS    60000   // wie lange ein Beitrittsversuch laeuft
 #define JOINER_RETRIES       3       // Versuche, bevor aufgegeben wird
+#define JOIN_RETRY_MS        300000  // erneuter Beitrittsversuch, falls ohne Dataset gestartet
 
 // --------------------------------------------------------------------------
 // Ziel: CoAP-Ressource des Collectors
@@ -128,6 +129,10 @@ static float g_rain  = 0.0f;  // mm, kumuliert
 // Statistik
 static uint32_t g_sent = 0;
 static uint32_t g_failed = 0;
+
+// Thread laeuft (OThread.start() erfolgt). Danach haelt der Stack die
+// Verbindung selbst; vorher muss der Sketch den Beitritt wiederholen.
+static bool g_threadStarted = false;
 
 // --------------------------------------------------------------------------
 // Sensoren
@@ -254,9 +259,6 @@ static void setPollPeriod(uint32_t ms) {
 // wiederverwendet - ein Reboot braucht kein offenes Anmeldefenster mehr.
 // --------------------------------------------------------------------------
 static bool joinNetwork() {
-  OThread.begin(false);            // kein Auto-Start; wir steuern die Reihenfolge
-  OThread.networkInterfaceUp();    // startJoiner() braucht das IPv6-Interface
-
   if (!OThread.hasActiveDataset()) {
 #if CONFIG_OPENTHREAD_JOINER
     Serial.println("Kein Dataset im NVS - starte Commissioning (Joiner).");
@@ -290,6 +292,7 @@ static bool joinNetwork() {
   configureSleepyEndDevice();
 
   OThread.start();
+  g_threadStarted = true;
 
   Serial.print("Warte auf Thread-Verbindung");
   uint32_t start = millis();
@@ -393,6 +396,9 @@ void setup() {
 
   coap.setTimeout(COAP_TIMEOUT_MS);
 
+  OThread.begin(false);            // kein Auto-Start; wir steuern die Reihenfolge
+  OThread.networkInterfaceUp();    // startJoiner() braucht das IPv6-Interface
+
   if (!joinNetwork()) {
     Serial.println("Thread-Beitritt fehlgeschlagen.");
   }
@@ -404,8 +410,18 @@ void setup() {
 void loop() {
   static uint32_t lastReport = 0;
   static bool first = true;
+  static uint32_t lastJoinTry = 0;
 
   uint32_t now = millis();
+
+  // Ohne Dataset gestartet (z. B. Collector noch aus oder Anmeldefenster
+  // zu): Commissioning regelmaessig wiederholen statt auf einen Reset zu warten.
+  if (!g_threadStarted && now - lastJoinTry >= JOIN_RETRY_MS) {
+    lastJoinTry = now;
+    Serial.println("Neuer Beitrittsversuch ...");
+    joinNetwork();
+    now = millis();
+  }
   if (first || now - lastReport >= REPORT_INTERVAL_MS) {
     first = false;
     lastReport = now;
