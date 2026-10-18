@@ -25,13 +25,13 @@ GET (idealer Endpoint für einen DB-Schreiber ert über dem OTBR).
 | I²C SDA (BME280) | 5 |
 | I²C SCL (BME280) | 4 |
 | Anemometer (Analog, ADC1_CH0) | 1 |
-| Regenmesser (Tipping Bucket, Interrupt) | 12 |
+| Regenmesser (Wippe, jede Flanke = 1 Kippung) | 12 |
 
 ## Verdrahtung
 
 - BME280 VCC → 3.3V, GND → GND, SDA → GPIO5, SCL → GPIO4 (I²C-Adresse `0x77`)
 - Anemometer Signal → GPIO1 (ADC1_CH0, bei Bedarf mit Pull-Down)
-- Regenmesser → GPIO12 (Interrupt, FALLING)
+- Regenmesser: Signal → GPIO12 (Interrupt, beide Flanken, 3 V / 0 V), GND → GND
 
 ## Kommunikationsarchitektur
 

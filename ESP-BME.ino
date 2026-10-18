@@ -70,7 +70,7 @@ static void readHardwareId() {
 #define I2C_SCL 4          // BME280 real an GPIO4 (SCL), ermittelt per Bus-Scan
 #define BME_ADDR 0x77      // BME280 antwortet auf 0x77 (statt Default 0x76)
 #define ANEMOMETER 1       // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
-#define INTERRUPT_PIN 12   // Regenmesser (Tipping Bucket), Interrupt
+#define INTERRUPT_PIN 12   // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V)
 #define LED_PIN 8          // Onboard-WS2812B (RGB-LED) - wird beim Start ausgeschaltet
 
 // Abtastung: SAMPLING_COUNT Messungen im Abstand SAMPLING_DELAY werden
@@ -80,6 +80,9 @@ static void readHardwareId() {
 
 // Regenmesser: 1 Kippung = 0.45 mm
 #define RAIN_MM_PER_TIP 0.45
+// Die Wippe schaltet bei jeder Kippung den Pegel um -> jede Flanke ist eine
+// Kippung. Flanken innerhalb dieser Zeit gelten als Prellen.
+#define RAIN_DEBOUNCE_US 150000
 
 // --------------------------------------------------------------------------
 // Sende- und Polltakt
@@ -155,6 +158,10 @@ static volatile uint32_t rainTicks = 0;  // vom ISR erhoeht, in loop() abgetrage
 static bme280Struct meanVals;  // zuletzt gemittelte Messwerte (T, P, Alt, Hum, Wind)
 
 IRAM_ATTR void rainSensorInterrupt() {
+  static uint32_t lastEdgeUs = 0;
+  uint32_t now = micros();
+  if (now - lastEdgeUs < RAIN_DEBOUNCE_US) return;
+  lastEdgeUs = now;
   rainTicks++;
 }
 
@@ -393,9 +400,11 @@ void setup() {
   pinMode(I2C_SCL, INPUT_PULLUP);
   I2CBME.begin(I2C_SDA, I2C_SCL, 100000);
 
-  // Regenmesser (hardware-entprellter Tipping Bucket)
-  pinMode(INTERRUPT_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), rainSensorInterrupt, FALLING);
+  // Regenmesser: Ausgang treibt aktiv 3 V / 0 V. Pull-down nur, damit ein
+  // abgezogenes Kabel nicht floatet und Phantom-Kippungen zaehlt.
+  pinMode(INTERRUPT_PIN, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), rainSensorInterrupt, CHANGE);
+  Serial.printf("Regenmesser an GPIO%d, Pegel %d\n", INTERRUPT_PIN, digitalRead(INTERRUPT_PIN));
 
   // BME280
   if (!bme.begin(BME_ADDR, &I2CBME)) {
