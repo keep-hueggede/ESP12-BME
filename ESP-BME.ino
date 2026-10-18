@@ -441,6 +441,16 @@ void loop() {
     joinNetwork();
     now = millis();
   }
+
+  // Each tip shows up immediately on the console (handy for testing the gauge)
+  static uint32_t shownTicks = 0;
+  uint32_t pending = rainTicks;
+  if (pending > shownTicks) {
+    Serial.printf("Kippung erkannt (seit letzter Meldung: %lu, Pegel %d)\n",
+                  (unsigned long)pending, digitalRead(INTERRUPT_PIN));
+  }
+  shownTicks = pending;
+
   if (first || now - lastReport >= REPORT_INTERVAL_MS) {
     first = false;
     lastReport = now;
