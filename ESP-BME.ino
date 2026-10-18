@@ -46,6 +46,7 @@
 #include <openthread/link.h>
 #include "esp_openthread_lock.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 
 // --------------------------------------------------------------------------
 // Identitaet dieses Knotens
@@ -80,9 +81,12 @@ static void readHardwareId() {
 
 // Regenmesser: 1 Kippung = 0.45 mm
 #define RAIN_MM_PER_TIP 0.45
-// Die Wippe schaltet bei jeder Kippung den Pegel um -> jede Flanke ist eine
-// Kippung. Flanken innerhalb dieser Zeit gelten als Prellen.
-#define RAIN_DEBOUNCE_US 150000
+// Die Wippe schaltet bei jeder Kippung den Pegel um. Ein Timer tastet den Pin
+// ab; gezaehlt wird nur, wenn der neue Pegel RAIN_STABLE_SAMPLES Abtastungen
+// lang stabil ist. Kurze Stoerimpulse, die zum alten Pegel zurueckkehren,
+// zaehlen so gar nicht.
+#define RAIN_SAMPLE_MS      20
+#define RAIN_STABLE_SAMPLES 5   // 5 x 20 ms = 100 ms
 
 // --------------------------------------------------------------------------
 // Sende- und Polltakt
@@ -153,16 +157,27 @@ TwoWire I2CBME = TwoWire(0);
 Adafruit_BME280 bme;
 OThreadCoAPClient coap;
 
-static volatile uint32_t rainTicks = 0;  // vom ISR erhoeht, in loop() abgetragen
+static volatile uint32_t rainTicks = 0;  // vom Abtast-Timer erhoeht, in loop() abgetragen
+static esp_timer_handle_t rainTimer = nullptr;
 
 static bme280Struct meanVals;  // zuletzt gemittelte Messwerte (T, P, Alt, Hum, Wind)
 
-IRAM_ATTR void rainSensorInterrupt() {
-  static uint32_t lastEdgeUs = 0;
-  uint32_t now = micros();
-  if (now - lastEdgeUs < RAIN_DEBOUNCE_US) return;
-  lastEdgeUs = now;
-  rainTicks++;
+// Runs every RAIN_SAMPLE_MS in the esp_timer task, independent of loop()
+static void rainSample(void *) {
+  static int accepted = -1;   // last stable level (-1 = not yet known)
+  static int candidate = -1;
+  static int stable = 0;
+  int level = digitalRead(INTERRUPT_PIN);
+  if (level != candidate) {
+    candidate = level;
+    stable = 0;
+    return;
+  }
+  if (stable < RAIN_STABLE_SAMPLES) stable++;
+  if (stable == RAIN_STABLE_SAMPLES && candidate != accepted) {
+    if (accepted != -1) rainTicks++;  // initial level is not a tip
+    accepted = candidate;
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -403,7 +418,9 @@ void setup() {
   // Regenmesser: Ausgang treibt aktiv 3 V / 0 V. Pull-down nur, damit ein
   // abgezogenes Kabel nicht floatet und Phantom-Kippungen zaehlt.
   pinMode(INTERRUPT_PIN, INPUT_PULLDOWN);
-  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), rainSensorInterrupt, CHANGE);
+  const esp_timer_create_args_t rainTimerArgs = { .callback = rainSample, .name = "rain" };
+  esp_timer_create(&rainTimerArgs, &rainTimer);
+  esp_timer_start_periodic(rainTimer, RAIN_SAMPLE_MS * 1000);
   Serial.printf("Regenmesser an GPIO%d, Pegel %d\n", INTERRUPT_PIN, digitalRead(INTERRUPT_PIN));
 
   // BME280

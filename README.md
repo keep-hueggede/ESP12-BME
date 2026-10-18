@@ -31,7 +31,7 @@ GET (idealer Endpoint für einen DB-Schreiber ert über dem OTBR).
 
 - BME280 VCC → 3.3V, GND → GND, SDA → GPIO5, SCL → GPIO4 (I²C-Adresse `0x77`)
 - Anemometer Signal → GPIO1 (ADC1_CH0, bei Bedarf mit Pull-Down)
-- Regenmesser: Signal → GPIO12 (Interrupt, beide Flanken, 3 V / 0 V), GND → GND
+- Regenmesser: Signal → GPIO12 (3 V / 0 V, jeder stabile Pegelwechsel = 1 Kippung), GND → GND
 
 ## Kommunikationsarchitektur
 
