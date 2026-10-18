@@ -25,8 +25,9 @@
  *                 Dataset, haette er auch ein eigenes Mesh-Local-Prefix und
  *                 waere fuer die anderen nicht routbar.
  *
- * Neuer Sensor:   Nur SENSOR_NAME anpassen und flashen. Der Collector
- *                 braucht keine Aenderung.
+ * Identitaet:     Der Knoten sendet seine eindeutige Hardware-ID (EUI-64)
+ *                 als "src". Den Anzeigenamen vergibt man in der Web-App
+ *                 auf dem Pi - jeder Sensor laeuft mit identischer Firmware.
  *
  * Benoetigt den Arduino-Core (arduino-esp32 v3.x) mit OpenThread-Unterstuetzung
  * und CONFIG_OPENTHREAD_JOINER=y (im Stock-Core gesetzt).
@@ -44,14 +45,22 @@
 #include <openthread/thread.h>
 #include <openthread/link.h>
 #include "esp_openthread_lock.h"
+#include "esp_mac.h"
 
 // --------------------------------------------------------------------------
 // Identitaet dieses Knotens
 //
-// Wird als Feld "src" mitgesendet und ist das einzige, was sich bei einem
-// weiteren Sensor derselben Bauart aendern muss.
+// Eindeutige Hardware-ID (IEEE-802.15.4-EUI-64 aus dem eFuse) als Hex-String.
+// Wird als Feld "src" mitgesendet; der Name wird auf dem Pi zugeordnet.
 // --------------------------------------------------------------------------
-static const char SENSOR_NAME[] = "wetter1";
+static char g_hwId[17] = "unknown";
+
+static void readHardwareId() {
+  uint8_t mac[8];
+  if (esp_read_mac(mac, ESP_MAC_IEEE802154) == ESP_OK) {
+    for (int i = 0; i < 8; i++) snprintf(g_hwId + 2 * i, 3, "%02x", mac[i]);
+  }
+}
 
 // --------------------------------------------------------------------------
 // Hardware-Konfiguration
@@ -197,7 +206,7 @@ static void buildJson(char *buf, size_t len) {
   snprintf(buf, len,
            "{\"src\":\"%s\",\"temp\":%.2f,\"pressure\":%.2f,\"altitude\":%.2f,"
            "\"humidity\":%.2f,\"wind\":%.2f,\"rain\":%.2f}",
-           SENSOR_NAME, (double)g_temp, (double)g_press, (double)g_alt,
+           g_hwId, (double)g_temp, (double)g_press, (double)g_alt,
            (double)g_hum, (double)g_wind, (double)g_rain);
 }
 
@@ -372,7 +381,8 @@ static void scanI2C() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.printf("=== ESP-BME '%s': Thread SED + CoAP-Push ===\n", SENSOR_NAME);
+  readHardwareId();
+  Serial.printf("=== ESP-BME %s: Thread SED + CoAP-Push ===\n", g_hwId);
 
   // Onboard-WS2812B-LED abschalten (GPIO8, im Projekt ungenutzt)
   pinMode(LED_PIN, OUTPUT);
