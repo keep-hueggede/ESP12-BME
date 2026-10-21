@@ -1,5 +1,5 @@
 /******************************************
- * ESP-BME - Wetter-Sensorknoten (Thread Sleepy End Device)
+ * ESP-BME - Wetter-Sensorknoten (Thread Sleepy End Device, Deep Sleep)
  *
  * ESP32-H2 (ESP32-H2FH4S) Wetterknoten. Er misst Temperatur, Luftdruck,
  * Luftfeuchte, Windgeschwindigkeit und Regen und SENDET die Werte im festen
@@ -7,38 +7,42 @@
  *
  * Rolle:          Thread Sleepy End Device (SED), CoAP-Client
  *
+ * Energie:        Der Knoten verbringt fast die ganze Zeit im Deep Sleep.
+ *                 Er wacht nur auf, um
+ *                  - eine Kippung des Regenmessers zu zaehlen (GPIO-Wake,
+ *                    ohne Funk, wenige ms), oder
+ *                  - alle REPORT_INTERVAL_S zu messen und zu senden.
+ *                 Gesendet wird die Regenmenge SEIT DER LETZTEN erfolgreich
+ *                 quittierten Meldung; der Pi summiert. Nicht quittierte
+ *                 Kippungen bleiben im RTC-Speicher und gehen mit der
+ *                 naechsten Meldung raus.
+ *
  * Warum senden statt abfragen:
  *                 Als SED ist das Funkmodul im Leerlauf ABGESCHALTET. Eine
- *                 eingehende Abfrage landet beim Parent, wird dort gepuffert
- *                 und erst beim naechsten Data Poll zugestellt - bei einem
- *                 stromsparenden Poll-Intervall laeuft jede Abfrage in den
- *                 Timeout. Ausserdem ist Empfangsbereitschaft der teure Teil,
- *                 nicht das Senden. Deshalb gibt es hier KEINEN CoAP-Server
- *                 mehr; der Knoten meldet sich von sich aus.
+ *                 Abfrage von aussen liefe in den Timeout. Deshalb gibt es
+ *                 KEINEN CoAP-Server; der Knoten meldet sich von sich aus.
  *
  * Netzbeitritt:   Per Thread-Commissioning. Der Knoten kennt nur den PSKd
  *                 (siehe JOINER_PSKD) und erhaelt das vollstaendige Dataset
- *                 - inklusive Network Key und Mesh-Local-Prefix - vom
- *                 Commissioner ueber die Luft. Es steht bewusst KEIN
- *                 Network Key und kein Mesh-Local-Prefix in diesem Sketch:
- *                 haette jeder Knoten sein eigenes per initNew() erzeugtes
- *                 Dataset, haette er auch ein eigenes Mesh-Local-Prefix und
- *                 waere fuer die anderen nicht routbar.
+ *                 vom Commissioner ueber die Luft. Danach liegt es im NVS.
  *
  * Identitaet:     Der Knoten sendet seine eindeutige Hardware-ID (EUI-64)
  *                 als "src". Den Anzeigenamen vergibt man in der Web-App
  *                 auf dem Pi - jeder Sensor laeuft mit identischer Firmware.
+ *
+ * Flashen:        Im Deep Sleep ist der USB-Port weg. Nach RESET bleibt der
+ *                 Knoten STARTUP_AWAKE_S wach - in diesem Fenster flashen.
  *
  * Benoetigt den Arduino-Core (arduino-esp32 v3.x) mit OpenThread-Unterstuetzung
  * und CONFIG_OPENTHREAD_JOINER=y (im Stock-Core gesetzt).
  *******************************************/
 #include <Arduino.h>
 #include <Wire.h>
+#include <sys/time.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <OThread.h>
 #include <OThreadCoAP.h>
-#include "SensorStruct.h"
 
 // Rohe OpenThread-Aufrufe: der Arduino-Wrapper exponiert fuer SED nur
 // getPollPeriod() (einen Getter), die Konfiguration gibt es nur nativ.
@@ -47,21 +51,7 @@
 #include "esp_openthread_lock.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
-
-// --------------------------------------------------------------------------
-// Identitaet dieses Knotens
-//
-// Eindeutige Hardware-ID (IEEE-802.15.4-EUI-64 aus dem eFuse) als Hex-String.
-// Wird als Feld "src" mitgesendet; der Name wird auf dem Pi zugeordnet.
-// --------------------------------------------------------------------------
-static char g_hwId[17] = "unknown";
-
-static void readHardwareId() {
-  uint8_t mac[8];
-  if (esp_read_mac(mac, ESP_MAC_IEEE802154) == ESP_OK) {
-    for (int i = 0; i < 8; i++) snprintf(g_hwId + 2 * i, 3, "%02x", mac[i]);
-  }
-}
+#include "esp_sleep.h"
 
 // --------------------------------------------------------------------------
 // Hardware-Konfiguration
@@ -71,44 +61,39 @@ static void readHardwareId() {
 #define I2C_SCL 4          // BME280 real an GPIO4 (SCL), ermittelt per Bus-Scan
 #define BME_ADDR 0x77      // BME280 antwortet auf 0x77 (statt Default 0x76)
 #define ANEMOMETER 1       // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
-#define INTERRUPT_PIN 12   // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V)
+#define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
 #define LED_PIN 8          // Onboard-WS2812B (RGB-LED) - wird beim Start ausgeschaltet
 
-// Abtastung: SAMPLING_COUNT Messungen im Abstand SAMPLING_DELAY werden
-// gemittelt. Das kostet SAMPLING_COUNT * SAMPLING_DELAY ms Wachzeit pro Zyklus.
-#define SAMPLING_COUNT 10
-#define SAMPLING_DELAY 100
-
-// Regenmesser: 1 Kippung = 0.45 mm
+// Regenmesser: 1 Kippung = 0.45 mm. Jeder stabile Pegelwechsel ist eine Kippung.
 #define RAIN_MM_PER_TIP 0.45
-// Die Wippe schaltet bei jeder Kippung den Pegel um. Ein Timer tastet den Pin
-// ab; gezaehlt wird nur, wenn der neue Pegel RAIN_STABLE_SAMPLES Abtastungen
-// lang stabil ist. Kurze Stoerimpulse, die zum alten Pegel zurueckkehren,
-// zaehlen so gar nicht.
-#define RAIN_SAMPLE_MS      20
-#define RAIN_STABLE_SAMPLES 5   // 5 x 20 ms = 100 ms
+#define RAIN_STABLE_MS  100   // level must hold this long to count (filters glitches)
+
+// Batterie ueber Spannungsteiler (2x 1 MOhm + 100 nF) an BATTERY_PIN.
+// Erst auf 1 setzen, wenn der Teiler verdrahtet ist - ein offener Pin liefert Unsinn.
+#define BATTERY_ENABLED  0
+#define BATTERY_PIN      2
+#define BATTERY_DIVIDER  2.0f
+#define BATTERY_LOW_V    2.3f   // 2x NiMH: ~1.15 V/Zelle -> seltener senden
 
 // --------------------------------------------------------------------------
-// Sende- und Polltakt
+// Takt
 // --------------------------------------------------------------------------
-#define REPORT_INTERVAL_MS   60000   // alle 60 s messen und senden
+#ifndef REPORT_INTERVAL_S
+#define REPORT_INTERVAL_S      300    // alle 5 min messen und senden
+#endif
+#define LOW_BATTERY_INTERVAL_S 1800   // bei schwacher Batterie alle 30 min
+#define STARTUP_AWAKE_S        30     // nach RESET wach bleiben (Konsole, Flashen)
+#define ATTACH_TIMEOUT_MS      15000  // max. Wartezeit auf die Thread-Verbindung
 
-// Data-Poll-Intervall des SED: so oft fragt der Knoten seinen Parent nach
-// gepufferten Nachrichten. Laenger = sparsamer, aber traeger fuer alles, was
-// von aussen an den Knoten geschickt wird. Da wir nur senden, darf es lang
-// sein; das ACK auf unser POST holt der Stack unmittelbar nach dem Senden ab.
-#define SED_POLL_PERIOD_MS   60000
-
-// Waehrend eines Sendevorgangs wird kurzzeitig schnell gepollt. Grund: die
-// Antwort auf ein CON-Request liegt beim Parent gepuffert und wird erst beim
-// naechsten Data Poll zugestellt. Mit dem langen Ruhe-Intervall kaeme das ACK
-// lange nach COAP_TIMEOUT_MS an, und jeder Push liefe in den Timeout.
-// Das Fenster kostet nur wenige hundert ms Funkzeit pro Minute.
+// Data-Poll-Intervall waehrend der kurzen Wachphase. Waehrend des Sendens wird
+// schnell gepollt, damit das ACK auf das CON-Request zeitnah ankommt.
+#define SED_POLL_PERIOD_MS     60000
 #define SED_TX_POLL_PERIOD_MS  250
 
-// Der Parent verwirft ein Kind, das sich SED_CHILD_TIMEOUT_S lang nicht
-// meldet. Muss deutlich ueber dem Poll-Intervall liegen.
-#define SED_CHILD_TIMEOUT_S  240
+// Der Parent verwirft ein Kind, das sich so lange nicht meldet. Muss ueber dem
+// laengsten Schlafintervall liegen, sonst ist nach jedem Aufwachen ein
+// kompletter Neu-Beitritt noetig (deutlich mehr Funkzeit).
+#define SED_CHILD_TIMEOUT_S    (2 * LOW_BATTERY_INTERVAL_S)
 
 // --------------------------------------------------------------------------
 // Commissioning
@@ -117,137 +102,159 @@ static void readHardwareId() {
 // oeffnet das Anmeldefenster beim Start bzw. auf Tastendruck 'c'.
 // --------------------------------------------------------------------------
 static const char JOINER_PSKD[] = "WETTER01";
-#define JOINER_TIMEOUT_MS    60000   // wie lange ein Beitrittsversuch laeuft
-#define JOINER_RETRIES       3       // Versuche, bevor aufgegeben wird
-#define JOIN_RETRY_MS        300000  // erneuter Beitrittsversuch, falls ohne Dataset gestartet
+#define JOINER_TIMEOUT_MS    60000
 
 // --------------------------------------------------------------------------
-// Ziel: CoAP-Ressource des Collectors
-//
-// Die Adresse wird NICHT hartcodiert, sondern zur Laufzeit aus der Rolle
-// abgeleitet: getLeaderRloc() liefert den Leader im eigenen Mesh-Local-
-// Prefix. Damit ueberlebt der Sensor jeden Prefix-Wechsel und jeden Tausch
-// des Collectors.
+// Ziel: CoAP-Ressource des Collectors (Leader im eigenen Mesh-Local-Prefix)
 // --------------------------------------------------------------------------
 static const char *INGEST_PATH = "ingest";
 #define COAP_TIMEOUT_MS  5000
 
 // --------------------------------------------------------------------------
-// Messwerte
+// Zustand, der den Deep Sleep ueberlebt (RTC-Speicher)
 // --------------------------------------------------------------------------
-static float g_temp  = 0.0f;
-static float g_press = 0.0f;  // hPa
-static float g_alt   = 0.0f;  // m
-static float g_hum   = 0.0f;  // %
-static float g_wind  = 0.0f;  // m/s
-static float g_rain  = 0.0f;  // mm, kumuliert
-
-// Statistik
-static uint32_t g_sent = 0;
-static uint32_t g_failed = 0;
-
-// Thread laeuft (OThread.start() erfolgt). Danach haelt der Stack die
-// Verbindung selbst; vorher muss der Sketch den Beitritt wiederholen.
-static bool g_threadStarted = false;
+RTC_DATA_ATTR static volatile int8_t   rtcRainLevel = -1;   // last stable level
+RTC_DATA_ATTR static volatile uint32_t rtcTipsPending = 0;  // not yet acknowledged
+RTC_DATA_ATTR static int64_t           rtcNextReportUs = 0;
+RTC_DATA_ATTR static uint32_t          rtcSent = 0;
+RTC_DATA_ATTR static uint32_t          rtcFailed = 0;
 
 // --------------------------------------------------------------------------
-// Sensoren
+// Messwerte dieser Wachphase
 // --------------------------------------------------------------------------
+static bool  g_bmeOk = false;
+static float g_temp, g_press, g_alt, g_hum;
+static float g_wind = 0.0f;     // m/s
+static float g_battery = NAN;   // V
+static char  g_hwId[17] = "unknown";
+
 TwoWire I2CBME = TwoWire(0);
 Adafruit_BME280 bme;
 OThreadCoAPClient coap;
-
-static volatile uint32_t rainTicks = 0;  // vom Abtast-Timer erhoeht, in loop() abgetragen
 static esp_timer_handle_t rainTimer = nullptr;
+static bool g_stayAwake = false;
+static uint32_t g_awakeUntilMs = 0;
 
-static bme280Struct meanVals;  // zuletzt gemittelte Messwerte (T, P, Alt, Hum, Wind)
+// --------------------------------------------------------------------------
+// Hilfsfunktionen
+// --------------------------------------------------------------------------
+// Wall-clock time keeps running in deep sleep (RTC timer), millis() does not
+static int64_t nowUs() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+}
 
-// Runs every RAIN_SAMPLE_MS in the esp_timer task, independent of loop()
+static void readHardwareId() {
+  uint8_t mac[8];
+  if (esp_read_mac(mac, ESP_MAC_IEEE802154) == ESP_OK) {
+    for (int i = 0; i < 8; i++) snprintf(g_hwId + 2 * i, 3, "%02x", mac[i]);
+  }
+}
+
+// Wait until the rain pin holds one level for RAIN_STABLE_MS (max. 1 s)
+static int stableRainLevel() {
+  int level = digitalRead(RAIN_PIN);
+  uint32_t since = millis(), start = since;
+  while (millis() - since < RAIN_STABLE_MS && millis() - start < 1000) {
+    delay(10);
+    int now = digitalRead(RAIN_PIN);
+    if (now != level) { level = now; since = millis(); }
+  }
+  return level;
+}
+
+static void countRainLevel(int level) {
+  if (rtcRainLevel >= 0 && level != rtcRainLevel) rtcTipsPending++;
+  rtcRainLevel = level;
+}
+
+// While awake the pin is sampled every 20 ms; same stability rule as above
 static void rainSample(void *) {
-  static int accepted = -1;   // last stable level (-1 = not yet known)
-  static int candidate = -1;
-  static int stable = 0;
-  int level = digitalRead(INTERRUPT_PIN);
-  if (level != candidate) {
-    candidate = level;
-    stable = 0;
-    return;
-  }
-  if (stable < RAIN_STABLE_SAMPLES) stable++;
-  if (stable == RAIN_STABLE_SAMPLES && candidate != accepted) {
-    if (accepted != -1) rainTicks++;  // initial level is not a tip
-    accepted = candidate;
+  static int candidate = -1, stable = 0;
+  int level = digitalRead(RAIN_PIN);
+  if (level != candidate) { candidate = level; stable = 0; return; }
+  if (stable < RAIN_STABLE_MS / 20) stable++;
+  if (stable == RAIN_STABLE_MS / 20 && candidate != rtcRainLevel) {
+    uint32_t before = rtcTipsPending;
+    countRainLevel(candidate);
+    if (rtcTipsPending != before) Serial.printf("Kippung erkannt (offen: %lu)\n", (unsigned long)rtcTipsPending);
   }
 }
 
-// --------------------------------------------------------------------------
-// Einzelnen Messwert vom BME280 + Anemometer lesen
-// --------------------------------------------------------------------------
-static void readSensors(Adafruit_BME280 *sens, bme280Struct *vals) {
-  vals->t = sens->readTemperature();
-  vals->p = sens->readPressure() / 100.0F;
-  vals->alt = sens->readAltitude(SEALEVELPRESSURE_HPA);
-  vals->hum = sens->readHumidity();
+static uint32_t reportIntervalS() {
+  if (!isnan(g_battery) && g_battery < BATTERY_LOW_V) return LOW_BATTERY_INTERVAL_S;
+  return REPORT_INTERVAL_S;
+}
 
-  double v = analogRead(ANEMOMETER);
+// --------------------------------------------------------------------------
+// Deep Sleep bis zur naechsten Meldung oder bis zur naechsten Kippung
+// --------------------------------------------------------------------------
+static void goToSleep() {
+  if (rainTimer) esp_timer_stop(rainTimer);
+
+  // Wake on the opposite of the last counted level. If the pin already changed,
+  // the chip wakes right away and counts it.
+  esp_sleep_enable_ext1_wakeup_io(1ULL << RAIN_PIN,
+                                  rtcRainLevel ? ESP_EXT1_WAKEUP_ANY_LOW : ESP_EXT1_WAKEUP_ANY_HIGH);
+
+  int64_t sleepUs = rtcNextReportUs - nowUs();
+  if (sleepUs < 1000000LL) sleepUs = 1000000LL;
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepUs);
+
+  Serial.printf("Deep Sleep fuer %lu s (Regen-Pegel %d, offen %lu Kippungen)\n",
+                (unsigned long)(sleepUs / 1000000LL), rtcRainLevel, (unsigned long)rtcTipsPending);
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+// --------------------------------------------------------------------------
+// Messen: BME280 im Forced Mode (eine Messung, danach schlaeft der Sensor),
+// Anemometer und Batterie als kurze Mittelwerte.
+// --------------------------------------------------------------------------
+static void measure() {
+  if (g_bmeOk) {
+    bme.takeForcedMeasurement();
+    g_temp  = bme.readTemperature();
+    g_press = bme.readPressure() / 100.0F;
+    g_alt   = bme.readAltitude(SEALEVELPRESSURE_HPA);
+    g_hum   = bme.readHumidity();
+  }
+
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogRead(ANEMOMETER);
   // ESP32-H2: 12-bit ADC (0-4095), 3.3V Referenz, Vollbereich = 25 m/s
-  vals->wSpeed = (v / 4095.0) * 3.3 * 25;
+  g_wind = (sum / 8.0f / 4095.0f) * 3.3f * 25.0f;
+
+#if BATTERY_ENABLED
+  uint32_t mv = 0;
+  for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(BATTERY_PIN);
+  g_battery = mv / 8.0f / 1000.0f * BATTERY_DIVIDER;
+#endif
 }
 
 // --------------------------------------------------------------------------
-// SAMPLING_COUNT-Werte sammeln und mitteln
+// Nutzlast: "rain" ist die Menge SEIT DER LETZTEN quittierten Meldung (mm),
+// "tips" die zugehoerige Anzahl Kippungen. Fehlende Werte werden weggelassen.
 // --------------------------------------------------------------------------
-static void sampleData(bme280Struct *mean) {
-  mean->t = 0; mean->p = 0; mean->alt = 0; mean->hum = 0; mean->wSpeed = 0;
-
-  bme280Struct sensorVals[SAMPLING_COUNT];
-  for (int i = 0; i < SAMPLING_COUNT; i++) {
-    readSensors(&bme, &sensorVals[i]);
-    delay(SAMPLING_DELAY);
+static void buildJson(char *buf, size_t len, uint32_t tips) {
+  int n = snprintf(buf, len, "{\"src\":\"%s\"", g_hwId);
+  if (g_bmeOk) {
+    n += snprintf(buf + n, len - n, ",\"temp\":%.2f,\"pressure\":%.2f,\"altitude\":%.2f,\"humidity\":%.2f",
+                  (double)g_temp, (double)g_press, (double)g_alt, (double)g_hum);
   }
-
-  for (int i = 0; i < SAMPLING_COUNT; i++) {
-    mean->t += sensorVals[i].t;
-    mean->p += sensorVals[i].p;
-    mean->alt += sensorVals[i].alt;
-    mean->hum += sensorVals[i].hum;
-    mean->wSpeed += sensorVals[i].wSpeed;
-  }
-  mean->t /= SAMPLING_COUNT;
-  mean->p /= SAMPLING_COUNT;
-  mean->alt /= SAMPLING_COUNT;
-  mean->hum /= SAMPLING_COUNT;
-  mean->wSpeed /= SAMPLING_COUNT;
+  n += snprintf(buf + n, len - n, ",\"wind\":%.2f,\"rain\":%.2f,\"tips\":%lu",
+                (double)g_wind, tips * RAIN_MM_PER_TIP, (unsigned long)tips);
+  if (!isnan(g_battery)) n += snprintf(buf + n, len - n, ",\"battery\":%.2f", (double)g_battery);
+  snprintf(buf + n, len - n, "}");
 }
 
 // --------------------------------------------------------------------------
-// Nutzlast bauen: ein vollstaendiges JSON-Objekt inklusive "src". Der
-// Collector reicht die Zeile unveraendert an den Pi weiter.
-// --------------------------------------------------------------------------
-static void buildJson(char *buf, size_t len) {
-  snprintf(buf, len,
-           "{\"src\":\"%s\",\"temp\":%.2f,\"pressure\":%.2f,\"altitude\":%.2f,"
-           "\"humidity\":%.2f,\"wind\":%.2f,\"rain\":%.2f}",
-           g_hwId, (double)g_temp, (double)g_press, (double)g_alt,
-           (double)g_hum, (double)g_wind, (double)g_rain);
-}
-
-// --------------------------------------------------------------------------
-// Als Sleepy End Device konfigurieren.
-//
-// mRxOnWhenIdle = false ist die eigentliche Ersparnis: das Funkmodul bleibt
-// zwischen den Data Polls aus. mDeviceType = false meldet den Knoten als MTD
-// an - er wird nie Router und nie Parent fuer andere Knoten.
-//
-// Muss VOR OThread.start() aufgerufen werden, damit der Knoten von vornherein
-// als SED attached und nicht erst als Router auftritt.
+// Als Sleepy End Device konfigurieren (VOR OThread.start()).
 // --------------------------------------------------------------------------
 static bool configureSleepyEndDevice() {
   otInstance *inst = OThread.getInstance();
-  if (!inst) {
-    Serial.println("Keine OpenThread-Instanz - SED-Konfiguration uebersprungen.");
-    return false;
-  }
+  if (!inst) return false;
 
   otLinkModeConfig mode;
   mode.mRxOnWhenIdle = false;  // Funkmodul im Leerlauf aus
@@ -261,18 +268,10 @@ static bool configureSleepyEndDevice() {
     otThreadSetChildTimeout(inst, SED_CHILD_TIMEOUT_S);
     ok = (e1 == OT_ERROR_NONE && e2 == OT_ERROR_NONE);
     esp_openthread_lock_release();
-    if (!ok) {
-      Serial.printf("SED-Konfiguration fehlgeschlagen: LinkMode=%d PollPeriod=%d\n", (int)e1, (int)e2);
-    }
-  } else {
-    Serial.println("OpenThread-Lock nicht bekommen - SED-Konfiguration uebersprungen.");
   }
   return ok;
 }
 
-// --------------------------------------------------------------------------
-// Data-Poll-Intervall zur Laufzeit umschalten.
-// --------------------------------------------------------------------------
 static void setPollPeriod(uint32_t ms) {
   otInstance *inst = OThread.getInstance();
   if (!inst) return;
@@ -283,31 +282,18 @@ static void setPollPeriod(uint32_t ms) {
 }
 
 // --------------------------------------------------------------------------
-// Dem Thread-Netz beitreten.
-//
-// Beim ersten Start per Commissioning (Joiner): der Knoten erhaelt das
-// vollstaendige Dataset vom Commissioner. Danach liegt es im NVS und wird
-// wiederverwendet - ein Reboot braucht kein offenes Anmeldefenster mehr.
+// Thread starten. Ohne Dataset: ein Commissioning-Versuch pro Wachphase.
 // --------------------------------------------------------------------------
 static bool joinNetwork() {
+  OThread.begin(false);
+  OThread.networkInterfaceUp();
+
   if (!OThread.hasActiveDataset()) {
 #if CONFIG_OPENTHREAD_JOINER
-    Serial.println("Kein Dataset im NVS - starte Commissioning (Joiner).");
-    Serial.println("Am Collector muss dafuer ein Anmeldefenster offen sein ('c' in dessen Konsole).");
-
-    bool joined = false;
-    for (int attempt = 1; attempt <= JOINER_RETRIES && !joined; attempt++) {
-      Serial.printf("  Beitrittsversuch %d/%d ...\n", attempt, JOINER_RETRIES);
-      otError err = OThread.startJoiner(JOINER_PSKD, JOINER_TIMEOUT_MS);
-      if (err == OT_ERROR_NONE) {
-        joined = true;
-      } else {
-        Serial.printf("  fehlgeschlagen (%d)\n", (int)err);
-      }
-    }
-
-    if (!joined) {
-      Serial.println("Commissioning fehlgeschlagen - kein Dataset erhalten.");
+    Serial.println("Kein Dataset im NVS - Commissioning (Anmeldefenster am Collector: 'c').");
+    otError err = OThread.startJoiner(JOINER_PSKD, JOINER_TIMEOUT_MS);
+    if (err != OT_ERROR_NONE) {
+      Serial.printf("Commissioning fehlgeschlagen (%d) - naechster Versuch beim naechsten Aufwachen.\n", (int)err);
       return false;
     }
     Serial.println("Commissioning erfolgreich, Dataset erhalten.");
@@ -315,180 +301,110 @@ static bool joinNetwork() {
     Serial.println("CONFIG_OPENTHREAD_JOINER ist im Core-Build nicht aktiviert.");
     return false;
 #endif
-  } else {
-    Serial.println("Wiederverwende gespeichertes Dataset aus NVS.");
   }
 
-  // SED-Modus setzen, BEVOR Thread startet.
   configureSleepyEndDevice();
-
   OThread.start();
-  g_threadStarted = true;
 
-  Serial.print("Warte auf Thread-Verbindung");
   uint32_t start = millis();
   while (OThread.otGetDeviceRole() < OT_ROLE_CHILD) {
-    if (millis() - start > 60000) {
-      Serial.println("\nTimeout - keine Thread-Verbindung.");
+    if (millis() - start > ATTACH_TIMEOUT_MS) {
+      Serial.println("Timeout - keine Thread-Verbindung.");
       return false;
     }
-    Serial.print('.');
-    delay(200);
+    delay(20);
   }
-  Serial.println();
-
-  Serial.printf("Verbunden als %s\n", OThread.otGetStringDeviceRole());
-  OThread.otPrintNetworkInformation(Serial);
-  Serial.printf("Mesh-Local EID: %s\n", OThread.getMeshLocalEid().toString().c_str());
-  Serial.printf("Poll-Intervall: %lu ms\n", (unsigned long)OThread.getPollPeriod());
+  Serial.printf("Verbunden als %s nach %lu ms\n", OThread.otGetStringDeviceRole(),
+                (unsigned long)(millis() - start));
   return true;
 }
 
 // --------------------------------------------------------------------------
-// Eine Messung an den Collector schicken.
-// Rueckgabe: true, wenn der Collector quittiert hat.
+// Senden. Quittierte Kippungen werden abgezogen; was waehrenddessen dazukam,
+// bleibt fuer die naechste Meldung stehen.
 // --------------------------------------------------------------------------
 static bool pushMeasurement() {
-  if (OThread.otGetDeviceRole() < OT_ROLE_CHILD) {
-    Serial.println("Nicht attached - Messung wird verworfen.");
-    g_failed++;
-    return false;
-  }
+  uint32_t tips = rtcTipsPending;
+  char json[256];
+  buildJson(json, sizeof(json), tips);
 
   IPAddress collector = OThread.getLeaderRloc();
-
-  char json[224];
-  buildJson(json, sizeof(json));
-
-  // Schnell pollen, solange wir auf das ACK warten - danach wieder schlafen.
   setPollPeriod(SED_TX_POLL_PERIOD_MS);
   int code = coap.POST(collector, INGEST_PATH, json);
   setPollPeriod(SED_POLL_PERIOD_MS);
 
   if (code > 0) {
-    g_sent++;
+    noInterrupts();   // rainSample may count concurrently
+    rtcTipsPending -= tips;
+    interrupts();
+    rtcSent++;
     Serial.printf("TX   -> %s  code=%d  %s\n", collector.toString().c_str(), code, json);
     return true;
   }
-
-  g_failed++;
-  Serial.printf("FAIL -> %s  code=%d (gesendet=%lu fehlgeschlagen=%lu)\n",
-                collector.toString().c_str(), code,
-                (unsigned long)g_sent, (unsigned long)g_failed);
+  rtcFailed++;
+  Serial.printf("FAIL -> %s  code=%d (gesendet=%lu fehlgeschlagen=%lu)\n", collector.toString().c_str(),
+                code, (unsigned long)rtcSent, (unsigned long)rtcFailed);
   return false;
 }
 
 // --------------------------------------------------------------------------
-// I2C-Bus scannen und gefundene Adressen ausgeben (Diagnose im Fehlerfall)
-// --------------------------------------------------------------------------
-static void scanI2C() {
-  Serial.println("I2C-Scan (SDA=" + String(I2C_SDA) + ", SCL=" + String(I2C_SCL) + "):");
-  byte error, address;
-  int nDevices = 0;
-  for (address = 1; address < 127; address++) {
-    I2CBME.beginTransmission(address);
-    error = I2CBME.endTransmission();
-    if (error == 0) {
-      Serial.print("  Geraet gefunden bei 0x");
-      if (address < 16) Serial.print("0");
-      Serial.print(address, HEX);
-      Serial.println();
-      nDevices++;
-    }
-  }
-  Serial.printf("  %d Geraet(e) gefunden.\n", nDevices);
-}
-
-// --------------------------------------------------------------------------
 void setup() {
-  Serial.begin(115200);
-  delay(500);
-  readHardwareId();
-  Serial.printf("=== ESP-BME %s: Thread SED + CoAP-Push ===\n", g_hwId);
+  pinMode(RAIN_PIN, INPUT);   // gauge drives both levels; no pull resistor needed
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
 
-  // Onboard-WS2812B-LED abschalten (GPIO8, im Projekt ungenutzt)
+  // Rain tip while sleeping: count it and go back to sleep without radio
+  if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    countRainLevel(stableRainLevel());
+    if (nowUs() < rtcNextReportUs) goToSleep();
+  }
+
+  bool resetStart = (cause != ESP_SLEEP_WAKEUP_EXT1 && cause != ESP_SLEEP_WAKEUP_TIMER);
+  Serial.begin(115200);
+  if (resetStart) delay(1500);  // give the USB console time to attach
+  readHardwareId();
+  Serial.printf("=== ESP-BME %s: Deep-Sleep-Zyklus (Wecker: %d) ===\n", g_hwId, (int)cause);
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  // I2C fuer BME280 (Pins/Adresse laut realer Verdrahtung)
+  if (rtcRainLevel < 0) rtcRainLevel = stableRainLevel();
+  const esp_timer_create_args_t rainTimerArgs = { .callback = rainSample, .name = "rain" };
+  esp_timer_create(&rainTimerArgs, &rainTimer);
+  esp_timer_start_periodic(rainTimer, 20 * 1000);
+
   pinMode(I2C_SDA, INPUT_PULLUP);
   pinMode(I2C_SCL, INPUT_PULLUP);
   I2CBME.begin(I2C_SDA, I2C_SCL, 100000);
-
-  // Regenmesser: Ausgang treibt aktiv 3 V / 0 V. Pull-down nur, damit ein
-  // abgezogenes Kabel nicht floatet und Phantom-Kippungen zaehlt.
-  pinMode(INTERRUPT_PIN, INPUT_PULLDOWN);
-  const esp_timer_create_args_t rainTimerArgs = { .callback = rainSample, .name = "rain" };
-  esp_timer_create(&rainTimerArgs, &rainTimer);
-  esp_timer_start_periodic(rainTimer, RAIN_SAMPLE_MS * 1000);
-  Serial.printf("Regenmesser an GPIO%d, Pegel %d\n", INTERRUPT_PIN, digitalRead(INTERRUPT_PIN));
-
-  // BME280
-  if (!bme.begin(BME_ADDR, &I2CBME)) {
-    Serial.println("BME280 nicht gefunden, Verdrahtung pruefen!");
-    scanI2C();
-    while (1) delay(1000);
+  g_bmeOk = bme.begin(BME_ADDR, &I2CBME);
+  if (g_bmeOk) {
+    bme.setSampling(Adafruit_BME280::MODE_FORCED, Adafruit_BME280::SAMPLING_X1, Adafruit_BME280::SAMPLING_X1,
+                    Adafruit_BME280::SAMPLING_X1, Adafruit_BME280::FILTER_OFF);
+  } else {
+    Serial.println("BME280 nicht gefunden - sende ohne T/p/rF.");
   }
+
+  measure();
+  rtcNextReportUs = nowUs() + (int64_t)reportIntervalS() * 1000000LL;
 
   coap.setTimeout(COAP_TIMEOUT_MS);
+  if (joinNetwork()) pushMeasurement();
 
-  OThread.begin(false);            // kein Auto-Start; wir steuern die Reihenfolge
-  OThread.networkInterfaceUp();    // startJoiner() braucht das IPv6-Interface
-
-  if (!joinNetwork()) {
-    Serial.println("Thread-Beitritt fehlgeschlagen.");
+  if (resetStart) {
+    // Stay reachable for a while after a reset (console, flashing)
+    g_stayAwake = true;
+    g_awakeUntilMs = millis() + STARTUP_AWAKE_S * 1000UL;
+    Serial.printf("Bleibe %d s wach, dann Deep Sleep. Regenmesser an GPIO%d, Pegel %d.\n",
+                  STARTUP_AWAKE_S, RAIN_PIN, rtcRainLevel);
+    return;
   }
-
-  Serial.printf("Bereit. Sende alle %d ms an /%s des Collectors.\n", REPORT_INTERVAL_MS, INGEST_PATH);
+  Serial.printf("Wachzeit %lu ms\n", (unsigned long)millis());
+  goToSleep();
 }
 
 // --------------------------------------------------------------------------
+// Wird nur im Wachfenster nach einem RESET erreicht.
+// --------------------------------------------------------------------------
 void loop() {
-  static uint32_t lastReport = 0;
-  static bool first = true;
-  static uint32_t lastJoinTry = 0;
-
-  uint32_t now = millis();
-
-  // Ohne Dataset gestartet (z. B. Collector noch aus oder Anmeldefenster
-  // zu): Commissioning regelmaessig wiederholen statt auf einen Reset zu warten.
-  if (!g_threadStarted && now - lastJoinTry >= JOIN_RETRY_MS) {
-    lastJoinTry = now;
-    Serial.println("Neuer Beitrittsversuch ...");
-    joinNetwork();
-    now = millis();
-  }
-
-  // Each tip shows up immediately on the console (handy for testing the gauge)
-  static uint32_t shownTicks = 0;
-  uint32_t pending = rainTicks;
-  if (pending > shownTicks) {
-    Serial.printf("Kippung erkannt (seit letzter Meldung: %lu, Pegel %d)\n",
-                  (unsigned long)pending, digitalRead(INTERRUPT_PIN));
-  }
-  shownTicks = pending;
-
-  if (first || now - lastReport >= REPORT_INTERVAL_MS) {
-    first = false;
-    lastReport = now;
-
-    sampleData(&meanVals);
-    g_temp  = (float)meanVals.t;
-    g_press = (float)meanVals.p;
-    g_alt   = (float)meanVals.alt;
-    g_hum   = (float)meanVals.hum;
-    g_wind  = (float)meanVals.wSpeed;
-
-    // Regen-Ticks abtragen und kumulieren
-    uint32_t ticks = 0;
-    noInterrupts();
-    ticks = rainTicks;
-    rainTicks = 0;
-    interrupts();
-    g_rain += ticks * RAIN_MM_PER_TIP;
-
-    pushMeasurement();
-  }
-
-  delay(100);
+  if (g_stayAwake && (int32_t)(millis() - g_awakeUntilMs) >= 0) goToSleep();
+  delay(50);
 }
