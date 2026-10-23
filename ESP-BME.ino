@@ -62,7 +62,7 @@
 #define BME_ADDR 0x77      // BME280 antwortet auf 0x77 (statt Default 0x76)
 #define ANEMOMETER 1       // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
 #define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
-#define LED_PIN 8          // Onboard-WS2812B (RGB-LED) - wird beim Start ausgeschaltet
+#define LED_PIN 8          // Onboard-WS2812B (RGB-LED) - wird bei jedem Mess-Zyklus schwarz gesetzt
 
 // Regenmesser: 1 Kippung = 0.45 mm. Jeder stabile Pegelwechsel ist eine Kippung.
 #define RAIN_MM_PER_TIP 0.45
@@ -364,8 +364,8 @@ void setup() {
   readHardwareId();
   Serial.printf("=== ESP-BME %s: Deep-Sleep-Zyklus (Wecker: %d) ===\n", g_hwId, (int)cause);
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  // WS2812 keeps its last colour; a pin level does not switch it off, a black frame does
+  rgbLedWrite(LED_PIN, 0, 0, 0);
 
   if (rtcRainLevel < 0) rtcRainLevel = stableRainLevel();
   const esp_timer_create_args_t rainTimerArgs = { .callback = rainSample, .name = "rain" };
