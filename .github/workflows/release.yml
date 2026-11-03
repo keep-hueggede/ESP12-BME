@@ -40,8 +40,10 @@ jobs:
         cp build/ESP-BME.ino.merged.bin dist/esp-bme-full.bin
         cd dist && sha256sum * > SHA256SUMS
 
+    # independent of the git checkout (which lives in a subfolder); errors show up as annotations
     - name: Publish release
-      env:
-        GH_TOKEN: ${{ github.token }}
-        GH_REPO: ${{ github.repository }}   # the checkout is in a subfolder
-      run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/*
+        generate_release_notes: true
+        fail_on_unmatched_files: true
