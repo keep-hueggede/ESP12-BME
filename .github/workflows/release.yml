@@ -1,0 +1,47 @@
+# Builds the sensor firmware for a version tag (v1.2.0) and publishes it as a
+# GitHub Release. The collector on the Pi picks up the newest release, hands it
+# to the receiver (ESP32-C6), and the sensors update themselves over Thread.
+
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the release
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: ESP-BME   # arduino-cli wants the folder named like the sketch
+
+    - uses: arduino/setup-arduino-cli@v2
+
+    - name: Install core and libraries
+      run: |
+        arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+        arduino-cli core install esp32:esp32@3.3.11 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+        arduino-cli lib install "Adafruit BME280 Library@2.3.0" "Adafruit Unified Sensor@1.1.15" "Adafruit BusIO@1.17.4"
+
+    - name: Build
+      run: |
+        version="${GITHUB_REF_NAME#v}"
+        mkdir -p build
+        arduino-cli compile --fqbn esp32:esp32:esp32h2:CDCOnBoot=cdc \
+          --build-property "compiler.cpp.extra_flags=-DFW_VERSION=\"$version\"" \
+          --output-dir build ESP-BME
+        mkdir dist
+        cp build/ESP-BME.ino.bin dist/esp-bme.bin
+        # merged image for the first flash over USB (bootloader + partitions + app)
+        cp build/ESP-BME.ino.merged.bin dist/esp-bme-full.bin
+        cd dist && sha256sum * > SHA256SUMS
+
+    - name: Publish release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}   # the checkout is in a subfolder
+      run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
