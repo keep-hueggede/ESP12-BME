@@ -87,6 +87,34 @@ arduino-cli compile --fqbn esp32:esp32:esp32h2 ESP-BME
 arduino-cli upload  -p <COM-Port> --fqbn esp32:esp32:esp32h2 ESP-BME
 ```
 
+## Releases und automatische Updates
+
+Ein Versions-Tag baut die Firmware in GitHub Actions und veroeffentlicht ein
+Release (`.github/workflows/release.yml`):
+
+```bash
+git tag v1.2.0 && git push origin v1.2.0
+```
+
+| Datei | Zweck |
+|---|---|
+| `esp-bme.bin` | App-Abbild fuer das Update ueber Thread |
+| `esp-bme-full.bin` | Komplettes Abbild (Bootloader + Partitionen + App) fuer das erste Flashen per USB, Adresse `0x0` |
+| `SHA256SUMS` | Pruefsummen |
+
+Der Collector auf dem Pi holt das neueste Release, gibt es an den Empfaenger
+(ESP32-C6) weiter, und jeder Sensor mit anderer Version aktualisiert sich bei
+seiner naechsten Meldung selbst (siehe Kopf von `ESP-BME.ino`). Die neue
+Firmware wird erst nach der ersten quittierten Messung bestaetigt, sonst
+schaltet der Bootloader auf die alte zurueck. Lokal gebaute Firmware meldet
+`"fw":"dev"` und wird nicht automatisch ersetzt.
+
+Erstes Flashen per USB (einmalig, danach laufen Updates ueber die Luft):
+
+```bash
+esptool.py --chip esp32h2 write_flash 0x0 esp-bme-full.bin
+```
+
 ## Ablauf in der Praxis
 
 1. Firmware flashen, Seriell-Monitor (115200 baud) öffnen.
