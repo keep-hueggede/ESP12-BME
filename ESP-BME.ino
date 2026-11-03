@@ -33,6 +33,14 @@
  * Flashen:        Im Deep Sleep ist der USB-Port weg. Nach RESET bleibt der
  *                 Knoten STARTUP_AWAKE_S wach - in diesem Fenster flashen.
  *
+ * Update:         Der Knoten meldet seine Version ("fw"). Hat der Collector
+ *                 eine andere, steht in der Antwort auf /ingest ein Angebot;
+ *                 der Knoten holt das Abbild dann blockweise (POST /fw),
+ *                 prueft die SHA-256 und startet neu. Die neue Firmware gilt
+ *                 erst nach der ersten quittierten Messung als gut - sonst
+ *                 schaltet der Bootloader beim naechsten Start zurueck.
+ *                 Lokal gebaute Firmware heisst "dev" und wird nie ersetzt.
+ *
  * Benoetigt den Arduino-Core (arduino-esp32 v3.x) mit OpenThread-Unterstuetzung
  * und CONFIG_OPENTHREAD_JOINER=y (im Stock-Core gesetzt).
  *******************************************/
@@ -52,6 +60,13 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_sleep.h"
+#include "esp_ota_ops.h"
+#include "mbedtls/sha256.h"
+
+// Set by the release build (-DFW_VERSION=\"1.2.0\"); local builds never get replaced
+#ifndef FW_VERSION
+#define FW_VERSION "dev"
+#endif
 
 // --------------------------------------------------------------------------
 // Hardware-Konfiguration
@@ -108,7 +123,13 @@ static const char JOINER_PSKD[] = "WETTER01";
 // Ziel: CoAP-Ressource des Collectors (Leader im eigenen Mesh-Local-Prefix)
 // --------------------------------------------------------------------------
 static const char *INGEST_PATH = "ingest";
+static const char *FW_PATH     = "fw";
 #define COAP_TIMEOUT_MS  5000
+
+// Firmware-Update: Bloecke zu 512 Byte, waehrenddessen schnell pollen
+#define OTA_POLL_PERIOD_MS   30
+#define OTA_BLOCK_RETRIES    5
+#define OTA_MAX_DURATION_MS  (15UL * 60UL * 1000UL)
 
 // --------------------------------------------------------------------------
 // Zustand, der den Deep Sleep ueberlebt (RTC-Speicher)
@@ -127,6 +148,7 @@ static float g_temp, g_press, g_alt, g_hum;
 static float g_wind = 0.0f;     // m/s
 static float g_battery = NAN;   // V
 static char  g_hwId[17] = "unknown";
+static char  g_reply[200] = "";   // collector's answer to the last report (may hold an update offer)
 
 TwoWire I2CBME = TwoWire(0);
 Adafruit_BME280 bme;
@@ -246,7 +268,7 @@ static void buildJson(char *buf, size_t len, uint32_t tips) {
   n += snprintf(buf + n, len - n, ",\"wind\":%.2f,\"rain\":%.2f,\"tips\":%lu",
                 (double)g_wind, tips * RAIN_MM_PER_TIP, (unsigned long)tips);
   if (!isnan(g_battery)) n += snprintf(buf + n, len - n, ",\"battery\":%.2f", (double)g_battery);
-  snprintf(buf + n, len - n, "}");
+  snprintf(buf + n, len - n, ",\"fw\":\"%s\"}", FW_VERSION);
 }
 
 // --------------------------------------------------------------------------
@@ -338,6 +360,8 @@ static bool pushMeasurement() {
     rtcTipsPending -= tips;
     interrupts();
     rtcSent++;
+    size_t n = coap.readPayload((uint8_t *)g_reply, sizeof(g_reply) - 1);
+    g_reply[n] = '\0';
     Serial.printf("TX   -> %s  code=%d  %s\n", collector.toString().c_str(), code, json);
     return true;
   }
@@ -345,6 +369,108 @@ static bool pushMeasurement() {
   Serial.printf("FAIL -> %s  code=%d (gesendet=%lu fehlgeschlagen=%lu)\n", collector.toString().c_str(),
                 code, (unsigned long)rtcSent, (unsigned long)rtcFailed);
   return false;
+}
+
+// --------------------------------------------------------------------------
+// Firmware-Update
+// --------------------------------------------------------------------------
+// The core must not confirm a new image on its own: only an acknowledged
+// measurement proves that sensors, Thread and CoAP still work.
+extern "C" bool verifyRollbackLater() { return true; }
+
+static void confirmFirmware() {
+  esp_ota_img_states_t state;
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  if (esp_ota_get_state_partition(running, &state) == ESP_OK && state == ESP_OTA_IMG_PENDING_VERIFY) {
+    esp_ota_mark_app_valid_cancel_rollback();
+    Serial.printf("Firmware %s bestaetigt.\n", FW_VERSION);
+  }
+}
+
+// Value of "key":"text" in a flat JSON object, copied to out ("" if missing)
+static void jsonText(const char *json, const char *key, char *out, size_t outLen) {
+  char pattern[24];
+  snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+  out[0] = '\0';
+  const char *start = strstr(json, pattern);
+  if (!start) return;
+  start += strlen(pattern);
+  const char *end = strchr(start, '"');
+  if (!end) return;
+  size_t len = min((size_t)(end - start), outLen - 1);
+  memcpy(out, start, len);
+  out[len] = '\0';
+}
+
+// Downloads the offered image block by block into the other app slot. Only
+// returns on failure; on success the node restarts into the new firmware.
+static void runOta(const char *offer) {
+  char version[32], sha[65];
+  jsonText(offer, "ota", version, sizeof(version));
+  jsonText(offer, "sha256", sha, sizeof(sha));
+  const char *sizeKey = strstr(offer, "\"size\":");
+  uint32_t size = sizeKey ? strtoul(sizeKey + 7, nullptr, 10) : 0;
+
+  const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+  if (!version[0] || strlen(sha) != 64 || !target || size == 0 || size > target->size) {
+    Serial.printf("Update-Angebot ungueltig: %s\n", offer);
+    return;
+  }
+  Serial.printf("Update %s -> %s (%lu Bytes) startet\n", FW_VERSION, version, (unsigned long)size);
+
+  esp_ota_handle_t ota;
+  if (esp_ota_begin(target, size, &ota) != ESP_OK) {
+    Serial.println("esp_ota_begin fehlgeschlagen");
+    return;
+  }
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+
+  IPAddress collector = OThread.getLeaderRloc();
+  static uint8_t block[OT_COAP_MAX_PAYLOAD];
+  uint32_t offset = 0, started = millis();
+  bool ok = true;
+  setPollPeriod(OTA_POLL_PERIOD_MS);
+  while (ok && offset < size) {
+    char request[12];
+    snprintf(request, sizeof(request), "%lu", (unsigned long)offset);
+    size_t n = 0;
+    for (int attempt = 0; attempt < OTA_BLOCK_RETRIES && n == 0; attempt++) {
+      if (coap.POST(collector, FW_PATH, request) == OT_COAP_RESP_OK) {
+        n = coap.readPayload(block, sizeof(block));
+      }
+    }
+    if (n == 0 || offset + n > size || millis() - started > OTA_MAX_DURATION_MS
+        || esp_ota_write(ota, block, n) != ESP_OK) {
+      Serial.printf("Update abgebrochen bei %lu/%lu Bytes\n", (unsigned long)offset, (unsigned long)size);
+      ok = false;
+      break;
+    }
+    mbedtls_sha256_update(&ctx, block, n);
+    offset += n;
+    if (offset % (64 * 1024) < n) Serial.printf("  %lu/%lu Bytes\n", (unsigned long)offset, (unsigned long)size);
+  }
+  setPollPeriod(SED_POLL_PERIOD_MS);
+
+  uint8_t digest[32];
+  char hex[65];
+  mbedtls_sha256_finish(&ctx, digest);
+  mbedtls_sha256_free(&ctx);
+  for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+
+  if (!ok || strcmp(hex, sha) != 0) {
+    if (ok) Serial.println("Update verworfen: SHA-256 stimmt nicht");
+    esp_ota_abort(ota);
+    return;
+  }
+  if (esp_ota_end(ota) != ESP_OK || esp_ota_set_boot_partition(target) != ESP_OK) {
+    Serial.println("Update verworfen: Abbild ungueltig");
+    return;
+  }
+  Serial.printf("Update auf %s geladen (%lu s) - Neustart\n", version, (unsigned long)((millis() - started) / 1000));
+  Serial.flush();
+  esp_restart();
 }
 
 // --------------------------------------------------------------------------
@@ -387,7 +513,11 @@ void setup() {
   rtcNextReportUs = nowUs() + (int64_t)reportIntervalS() * 1000000LL;
 
   coap.setTimeout(COAP_TIMEOUT_MS);
-  if (joinNetwork()) pushMeasurement();
+  if (joinNetwork() && pushMeasurement()) {
+    confirmFirmware();
+    bool batteryLow = !isnan(g_battery) && g_battery < BATTERY_LOW_V;
+    if (strstr(g_reply, "\"ota\"") && !batteryLow) runOta(g_reply);
+  }
 
   if (resetStart) {
     // Stay reachable for a while after a reset (console, flashing)
