@@ -2,7 +2,7 @@
  * ESP-BME - Wetter-Sensorknoten (Thread Sleepy End Device, Deep Sleep)
  *
  * ESP32-H2 (ESP32-H2FH4S) Wetterknoten. Er misst Temperatur, Luftdruck,
- * Luftfeuchte, Windgeschwindigkeit und Regen und SENDET die Werte im festen
+ * Luftfeuchte, Windgeschwindigkeit, Windrichtung und Regen und SENDET die Werte im festen
  * Takt per CoAP an den Collector (ESP-ThreadReceiver, ESP32-C6).
  *
  * Rolle:          Thread Sleepy End Device (SED), CoAP-Client
@@ -77,6 +77,11 @@
 #define BME_ADDR 0x77      // BME280 antwortet auf 0x77 (statt Default 0x76)
 #define ANEMOMETER 1       // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
 #define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
+#define VANE_TX 10         // UART1 TX -> RS485 module RXD
+#define VANE_RX 11         // UART1 RX <- RS485 module TXD
+#define VANE_BAUD 4800     // CWT-SWD wind vane default: Modbus RTU 4800 8N1, address 1
+#define VANE_ADDR 1
+#define VANE_TIMEOUT_MS 300
 #define LED_PIN 8          // Onboard-WS2812B (RGB-LED) - wird bei jedem Mess-Zyklus schwarz gesetzt
 
 // Regenmesser: 1 Kippung = 0.45 mm. Jeder stabile Pegelwechsel ist eine Kippung.
@@ -147,6 +152,7 @@ static bool  g_bmeOk = false;
 static float g_temp, g_press, g_alt, g_hum;
 static float g_wind = 0.0f;     // m/s
 static float g_battery = NAN;   // V
+static int   g_windDir = -1;    // degrees 0-359, -1 = vane not answering
 static char  g_hwId[17] = "unknown";
 static char  g_reply[200] = "";   // collector's answer to the last report (may hold an update offer)
 
@@ -234,6 +240,62 @@ static void goToSleep() {
 // Messen: BME280 im Forced Mode (eine Messung, danach schlaeft der Sensor),
 // Anemometer und Batterie als kurze Mittelwerte.
 // --------------------------------------------------------------------------
+static uint16_t modbusCrc(const uint8_t *data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+  }
+  return crc;
+}
+
+// Modbus RTU function 03 (read holding registers); returns false on timeout, exception or bad CRC
+static bool modbusRead(HardwareSerial &port, uint8_t addr, uint16_t reg, uint8_t count, uint16_t *out) {
+  uint8_t req[8] = { addr, 0x03, (uint8_t)(reg >> 8), (uint8_t)reg, 0, count };
+  uint16_t crc = modbusCrc(req, 6);
+  req[6] = crc & 0xFF;
+  req[7] = crc >> 8;
+  while (port.available()) port.read();
+  port.write(req, sizeof(req));
+  port.flush();
+
+  const size_t want = 5 + 2 * count;
+  uint8_t resp[5 + 2 * 8];
+  size_t got = 0;
+  uint32_t start = millis();
+  while (got < want && millis() - start < VANE_TIMEOUT_MS) {
+    if (port.available()) {
+      resp[got++] = port.read();
+      if (got == 5 && (resp[1] & 0x80)) break;  // exception reply is 5 bytes
+    } else {
+      delay(1);
+    }
+  }
+  if (got != want || resp[0] != addr || resp[1] != 0x03 || resp[2] != 2 * count) return false;
+  if (modbusCrc(resp, want - 2) != (uint16_t)(resp[want - 2] | (resp[want - 1] << 8))) return false;
+  for (int i = 0; i < count; i++) out[i] = (resp[3 + 2 * i] << 8) | resp[4 + 2 * i];
+  return true;
+}
+
+// Register 0 = sector 0-7 (N, NE, ...), register 1 = angle 0-360 on the 360 degree model.
+// The angle is only trusted if it lies in the reported sector.
+static void readVane() {
+  HardwareSerial vane(1);
+  vane.begin(VANE_BAUD, SERIAL_8N1, VANE_RX, VANE_TX);
+  uint16_t r[2];
+  if (modbusRead(vane, VANE_ADDR, 0x0000, 2, r)) {
+    Serial.printf("Windfahne: Register 0=%u 1=%u\n", r[0], r[1]);
+    if (r[1] <= 360 && ((r[1] + 22) / 45) % 8 == r[0]) g_windDir = r[1] % 360;
+    else if (r[0] < 8) g_windDir = r[0] * 45;
+  } else if (modbusRead(vane, VANE_ADDR, 0x0000, 1, r)) {
+    Serial.printf("Windfahne: Register 0=%u\n", r[0]);
+    if (r[0] < 8) g_windDir = r[0] * 45;
+  } else {
+    Serial.println("Windfahne antwortet nicht.");
+  }
+  vane.end();
+}
+
 static void measure() {
   if (g_bmeOk) {
     bme.takeForcedMeasurement();
@@ -247,6 +309,8 @@ static void measure() {
   for (int i = 0; i < 8; i++) sum += analogRead(ANEMOMETER);
   // ESP32-H2: 12-bit ADC (0-4095), 3.3V Referenz, Vollbereich = 25 m/s
   g_wind = (sum / 8.0f / 4095.0f) * 3.3f * 25.0f;
+
+  readVane();
 
 #if BATTERY_ENABLED
   uint32_t mv = 0;
@@ -267,6 +331,7 @@ static void buildJson(char *buf, size_t len, uint32_t tips) {
   }
   n += snprintf(buf + n, len - n, ",\"wind\":%.2f,\"rain\":%.2f,\"tips\":%lu",
                 (double)g_wind, tips * RAIN_MM_PER_TIP, (unsigned long)tips);
+  if (g_windDir >= 0) n += snprintf(buf + n, len - n, ",\"winddir\":%d", g_windDir);
   if (!isnan(g_battery)) n += snprintf(buf + n, len - n, ",\"battery\":%.2f", (double)g_battery);
   snprintf(buf + n, len - n, ",\"fw\":\"%s\"}", FW_VERSION);
 }
@@ -347,7 +412,7 @@ static bool joinNetwork() {
 // --------------------------------------------------------------------------
 static bool pushMeasurement() {
   uint32_t tips = rtcTipsPending;
-  char json[256];
+  char json[320];
   buildJson(json, sizeof(json), tips);
 
   IPAddress collector = OThread.getLeaderRloc();
