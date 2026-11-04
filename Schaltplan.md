@@ -12,12 +12,12 @@ Stiftleisten heraus. Alle benötigten Pins dieses Projekts liegen auf der
 ```text
 3V3   [1]            [1]  5V
 GND   [2]            [2]  GND
-GPIO0 [3]            [3]  GPIO11
-GPIO1 [4]  ESP32-H2  [4]  GPIO10   <- Anemometer
+GPIO0 [3]            [3]  GPIO11   <- RS485-Modul TXD (Windfahne)
+GPIO1 [4]  ESP32-H2  [4]  GPIO10   <- RS485-Modul RXD (Windfahne)
 GPIO2 [5]            [5]  GPIO9  (BOOT)
 GPIO3 [6]            [6]  GPIO8  (RGB-LED)
-GPIO4 [7]            [7]  GPIO22     <- BME280 SCL
-GPIO5 [8]            [8]  GPIO25     <- BME280 SDA
+GPIO4 [7]            [7]  GPIO22
+GPIO5 [8]            [8]  GPIO25
 GPIO12[9]            [9]  GPIO23 (UART RX)
 GPIO13[10]           [10] GPIO24 (UART TX)
 ```
@@ -43,6 +43,29 @@ GPIO13[10]           [10] GPIO24 (UART TX)
 > (GPIO36 kommt nur am klassischen ESP32 vor). Der Sketch ruft
 > `analogRead(GPIO1)` auf — der Arduino-Core erwartet die Pin-Nummer, das
 > ESP-IDF-Makro `ADC1_CH0` existiert dort nicht.
+
+## Windfahne (RS485, Modbus RTU)
+
+ComWinTop CWT-SWD, 10–30 V, Modbus RTU 4800 Baud 8N1, Adresse 1, Funktion 03.
+Der Sketch liest sie bei jedem Aufwachen über UART1 und sendet `winddir`
+(Grad, 0 = Nord). Ein RS485-TTL-Modul mit automatischer Richtungsumschaltung
+setzt die Pegel um.
+
+| Von                  | An                          |
+|----------------------|-----------------------------|
+| ESP32-H2 GPIO10 (TX) | RS485-Modul **RXD**         |
+| ESP32-H2 GPIO11 (RX) | RS485-Modul **TXD**         |
+| ESP32-H2 3V3         | RS485-Modul VCC             |
+| ESP32-H2 GND         | RS485-Modul GND **und** Minus des 12-V-Netzteils |
+| RS485-Modul A+       | Windfahne gelb (485-A)      |
+| RS485-Modul B−       | Windfahne blau (485-B)      |
+| 12-V-Netzteil +      | Windfahne braun             |
+| 12-V-Netzteil −      | Windfahne schwarz           |
+
+- Die Windfahne braucht ein **eigenes 10–30-V-Netzteil**; keinesfalls an 3V3/5V.
+- Antwortet die Fahne nicht, A und B tauschen (die Herstellerangaben zu den
+  Aderfarben widersprechen sich) bzw. RXD/TXD am Modul tauschen.
+- Die serielle Konsole zeigt bei jedem Zyklus `Windfahne: Register 0=… 1=…`.
 
 ## Stromversorgung
 
