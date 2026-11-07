@@ -79,7 +79,7 @@
 #define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
 #define VANE_TX 10         // UART1 TX -> RS485 module RXD
 #define VANE_RX 11         // UART1 RX <- RS485 module TXD
-#define VANE_BAUD 4800     // CWT-SWD wind vane default: Modbus RTU 4800 8N1, address 1
+// CWT-SWD wind vane: Modbus RTU 8N1, address 1, 4800 baud by default (2400/9600 selectable)
 #define VANE_ADDR 1
 #define VANE_TIMEOUT_MS 300
 #define LED_PIN 8          // Onboard-WS2812B (RGB-LED) - wird bei jedem Mess-Zyklus schwarz gesetzt
@@ -249,8 +249,13 @@ static uint16_t modbusCrc(const uint8_t *data, size_t len) {
   return crc;
 }
 
-// Modbus RTU function 03 (read holding registers); returns false on timeout, exception or bad CRC
-static bool modbusRead(HardwareSerial &port, uint8_t addr, uint16_t reg, uint8_t count, uint16_t *out) {
+static uint8_t g_rx[40];   // raw bytes of the last Modbus exchange, for diagnostics
+static size_t  g_rxLen = 0;
+
+// Modbus RTU function 03 (read holding registers). Searches the received bytes for
+// the reply, so a module that echoes the request does not matter.
+static bool modbusRead(HardwareSerial &port, uint8_t addr, uint16_t reg, uint8_t count, uint16_t *out,
+                       uint32_t timeoutMs = VANE_TIMEOUT_MS) {
   uint8_t req[8] = { addr, 0x03, (uint8_t)(reg >> 8), (uint8_t)reg, 0, count };
   uint16_t crc = modbusCrc(req, 6);
   req[6] = crc & 0xFF;
@@ -260,40 +265,56 @@ static bool modbusRead(HardwareSerial &port, uint8_t addr, uint16_t reg, uint8_t
   port.flush();
 
   const size_t want = 5 + 2 * count;
-  uint8_t resp[5 + 2 * 8];
-  size_t got = 0;
+  g_rxLen = 0;
   uint32_t start = millis();
-  while (got < want && millis() - start < VANE_TIMEOUT_MS) {
-    if (port.available()) {
-      resp[got++] = port.read();
-      if (got == 5 && (resp[1] & 0x80)) break;  // exception reply is 5 bytes
-    } else {
-      delay(1);
+  while (millis() - start < timeoutMs) {
+    if (!port.available()) { delay(1); continue; }
+    if (g_rxLen < sizeof(g_rx)) g_rx[g_rxLen++] = port.read(); else port.read();
+    if (g_rxLen < want) continue;
+    const uint8_t *f = g_rx + g_rxLen - want;
+    if (f[0] == addr && f[1] == 0x03 && f[2] == 2 * count
+        && modbusCrc(f, want - 2) == (uint16_t)(f[want - 2] | (f[want - 1] << 8))) {
+      for (int i = 0; i < count; i++) out[i] = (f[3 + 2 * i] << 8) | f[4 + 2 * i];
+      return true;
     }
   }
-  if (got != want || resp[0] != addr || resp[1] != 0x03 || resp[2] != 2 * count) return false;
-  if (modbusCrc(resp, want - 2) != (uint16_t)(resp[want - 2] | (resp[want - 1] << 8))) return false;
-  for (int i = 0; i < count; i++) out[i] = (resp[3 + 2 * i] << 8) | resp[4 + 2 * i];
-  return true;
+  return false;
+}
+
+static void printRx() {
+  Serial.printf("Windfahne: %u Byte empfangen:", (unsigned)g_rxLen);
+  for (size_t i = 0; i < g_rxLen; i++) Serial.printf(" %02X", g_rx[i]);
+  Serial.println();
 }
 
 // Register 0 = sector 0-7 (N, NE, ...), register 1 = angle 0-360 on the 360 degree model.
 // The angle is only trusted if it lies in the reported sector.
+// Tries the vane's selectable baud rates and remembers the one that answered.
+RTC_DATA_ATTR static uint8_t rtcVaneBaud = 0;
 static void readVane() {
+  static const uint32_t bauds[] = { 4800, 9600, 2400 };
   HardwareSerial vane(1);
-  vane.begin(VANE_BAUD, SERIAL_8N1, VANE_RX, VANE_TX);
   uint16_t r[2];
-  if (modbusRead(vane, VANE_ADDR, 0x0000, 2, r)) {
-    Serial.printf("Windfahne: Register 0=%u 1=%u\n", r[0], r[1]);
-    if (r[1] <= 360 && ((r[1] + 22) / 45) % 8 == r[0]) g_windDir = r[1] % 360;
-    else if (r[0] < 8) g_windDir = r[0] * 45;
-  } else if (modbusRead(vane, VANE_ADDR, 0x0000, 1, r)) {
-    Serial.printf("Windfahne: Register 0=%u\n", r[0]);
-    if (r[0] < 8) g_windDir = r[0] * 45;
-  } else {
-    Serial.println("Windfahne antwortet nicht.");
+  for (int k = 0; k < 3; k++) {
+    uint8_t idx = (rtcVaneBaud + k) % 3;
+    vane.begin(bauds[idx], SERIAL_8N1, VANE_RX, VANE_TX);
+    if (modbusRead(vane, VANE_ADDR, 0x0000, 2, r)) {
+      Serial.printf("Windfahne (%lu Baud): Register 0=%u 1=%u\n", (unsigned long)bauds[idx], r[0], r[1]);
+      if (r[1] <= 360 && ((r[1] + 22) / 45) % 8 == r[0]) g_windDir = r[1] % 360;
+      else if (r[0] < 8) g_windDir = r[0] * 45;
+    } else if (modbusRead(vane, VANE_ADDR, 0x0000, 1, r)) {
+      Serial.printf("Windfahne (%lu Baud): Register 0=%u\n", (unsigned long)bauds[idx], r[0]);
+      if (r[0] < 8) g_windDir = r[0] * 45;
+    } else {
+      Serial.printf("Windfahne antwortet nicht bei %lu Baud. ", (unsigned long)bauds[idx]);
+      printRx();
+      vane.end();
+      continue;
+    }
+    rtcVaneBaud = idx;
+    vane.end();
+    return;
   }
-  vane.end();
 }
 
 static void measure() {
