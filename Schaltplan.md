@@ -55,16 +55,22 @@ BME280 SDA GP5 [8]  │        GP10 │ [8]  GP10 (TX)  -> RS485-Modul
 
 ### Anemometer (Windgeschwindigkeit)
 
-- Signal → GP1, Masse → GND. Der Sketch rechnet `0–3,3 V = 0–25 m/s`.
-- Das Signal darf **3,3 V nicht überschreiten**. Bei höherer Ausgangsspannung
-  einen Spannungsteiler vorschalten:
+Funduino-Schalenanemometer: ein kleiner Generator, **keine Versorgung nötig**.
+Ausgang 0–2 V, Windgeschwindigkeit = Spannung × 25 m/s.
+
+- Signal → GP1, Masse → GND, **direkt, ohne Spannungsteiler** (2 V < 3,3 V).
+- Der Sketch mittelt bei jedem Aufwachen 3 s lang (`wind`) und meldet den
+  höchsten Wert in diesem Fenster als Böe (`gust`).
+- Bei Windstille sind Werte um 0 normal.
+- Wird das Schalenkreuz rückwärts gedreht, kehrt der Generator die Polarität um.
+  Schutz für GP1, falls das vorkommen kann:
 
 ```text
- Anemometer Signal ── 10 kΩ ──┬── GP1
-                              │
-                            6,8 kΩ
-                              │
-                             GND        (5 V → ca. 2,0 V am ADC)
+ Anemometer Signal ── 1 kΩ ──┬── GP1
+                             │
+                          Schottky-Diode (Kathode an GP1)
+                             │
+                            GND
 ```
 
 ### Regenmesser (Wippe)
