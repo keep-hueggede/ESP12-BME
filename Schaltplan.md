@@ -75,6 +75,9 @@ BME280 SDA GP5 [8]  │        GP10 │ [8]  GP10 (TX)  -> RS485-Modul
 
 ### Windfahne (RS485, Modbus RTU)
 
+> Derzeit abgeschaltet (`VANE_ENABLED 0` im Sketch), da die vorhandene Windfahne
+> nicht antwortet. Zum Aktivieren auf `1` setzen.
+
 Windfahne mit RS485-Ausgang (10–30 V, Modbus RTU, Adresse 1, 4800 Baud 8N1).
 Der Sketch liest sie bei jedem Aufwachen über UART1 und sendet `winddir`
 (Grad, 0 = Nord). Er probiert 4800/9600/2400 Baud und die Funktionen 03/04

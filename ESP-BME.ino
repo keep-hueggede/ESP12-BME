@@ -79,6 +79,7 @@
 #define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
 #define VANE_TX 10         // UART1 TX -> RS485 module input (labelled TXD or RXD, see Schaltplan.md)
 #define VANE_RX 11         // UART1 RX <- RS485 module output
+#define VANE_ENABLED 0    // 1 = read the RS485 wind vane on every wake
 // CWT-SWD wind vane: Modbus RTU 8N1, address 1, 4800 baud by default (2400/9600 selectable)
 #define VANE_ADDR 1
 #define VANE_TIMEOUT_MS 300
@@ -340,7 +341,7 @@ static void measure() {
   // ESP32-H2: 12-bit ADC (0-4095), 3.3V Referenz, Vollbereich = 25 m/s
   g_wind = (sum / 8.0f / 4095.0f) * 3.3f * 25.0f;
 
-  readVane();
+  if (VANE_ENABLED) readVane();
 
 #if BATTERY_ENABLED
   uint32_t mv = 0;
