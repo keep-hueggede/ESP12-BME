@@ -1,140 +1,122 @@
 # Schaltplan — ESP-BME Wetterstation (ESP32-H2)
 
-Verdrahtung der Sensoren an den **Waveshare ESP32-H2-Zero** (ESP32-H2FH4S),
-passend zum Sketch `ESP-BME.ino` (Thread + CoAP).
+Verdrahtung der Sensoren am **ESP32-H2-Modul (Supermini-Bauform)**, passend zum
+Sketch `ESP-BME.ino` (Thread + CoAP, Deep Sleep).
 
-## Board-Spezifisch
+> **Alles, was an einem GPIO hängt, darf dort höchstens 3,3 V liefern.**
+> Der ESP32-H2 ist nicht 5-V-tolerant. Sensoren und das RS485-Modul deshalb an
+> **3V3** versorgen – nicht an 5V. Einzige Ausnahme ist die Windfahne mit eigenem
+> 12-V-Netzteil; sie hängt nur am RS485-Bus, nicht an einem GPIO.
 
-Der Waveshare ESP32-H2-Zero führt 19 nutzbare GPIOs auf zwei einseitigen
-Stiftleisten heraus. Alle benötigten Pins dieses Projekts liegen auf der
-**linken Kopfzeile**:
+## Board-Pinbelegung
+
+Draufsicht, USB-C oben. Gezählt wird je Leiste von oben nach unten.
 
 ```text
-3V3   [1]            [1]  5V
-GND   [2]            [2]  GND
-GPIO0 [3]            [3]  GPIO11   <- RS485-Modul TXD (Windfahne)
-GPIO1 [4]  ESP32-H2  [4]  GPIO10   <- RS485-Modul RXD (Windfahne)
-GPIO2 [5]            [5]  GPIO9  (BOOT)
-GPIO3 [6]            [6]  GPIO8  (RGB-LED)
-GPIO4 [7]            [7]  GPIO22
-GPIO5 [8]            [8]  GPIO25
-GPIO12[9]            [9]  GPIO23 (UART RX)
-GPIO13[10]           [10] GPIO24 (UART TX)
+                    ┌───[USB-C]───┐
+          GP24 [1]  │ TX       5V │ [1]  5V
+          GP23 [2]  │ RX      GND │ [2]  GND        <- GND-Schiene
+          GP0  [3]  │         3V3 │ [3]  3V3        <- 3V3-Schiene
+Anemometer GP1 [4]  │        GP14 │ [4]  GP14
+          GP2  [5]  │        GP13 │ [5]  GP13
+          GP3  [6]  │        GP12 │ [6]  GP12       <- Regenmesser
+BME280 SCL GP4 [7]  │        GP11 │ [7]  GP11 (RX)  <- RS485-Modul
+BME280 SDA GP5 [8]  │        GP10 │ [8]  GP10 (TX)  -> RS485-Modul
+          GP8  [9]  │         GP9 │ [9]  GP9 (BOOT)
+                    └─────────────┘
+          Lötpads unten: GP26/GP27 (USB D-/D+), GP22, GP25
 ```
 
-- **Betriebsspannung strikt 3,3 V** — Pins sind nicht 5V-tolerant.
-- **GPIO8** ist fest mit der Onboard-WS2812B-LED verschaltet (im Projekt ungenutzt).
-- **GPIO9** liegt am BOOT-Taster (im Projekt ungenutzt).
-- **GPIO23/24** = UART0 (Serial-Debug), über USB-C erreichbar.
-- **ADC0–ADC5** = analog lesbar; **ADC1_CH0 = GPIO1** für den Anemometer.
+- **GP8** = Onboard-RGB-LED (WS2812), wird bei jedem Zyklus schwarz geschaltet.
+- **GP9** = BOOT-Taster; **GP26/GP27** = USB – nicht belegen.
+- **GP23/GP24** = UART0; die Konsole läuft über USB, die Pins bleiben frei.
+- **GP2** ist für die Batteriemessung reserviert (`BATTERY_ENABLED`, derzeit aus).
 
 ## Pin-Zuordnung
 
-| Funktion        | ESP32-H2 Pin | Sensor/Anschluss                                      |
-|-----------------|--------------|-------------------------------------------------------|
-| I²C SDA         | GPIO5        | BME280 SDA (Pull-up 4,7k gegen 3V3, falls nicht onboard) |
-| I²C SCL         | GPIO4        | BME280 SCL (Pull-up 4,7k gegen 3V3, falls nicht onboard) |
-| Anemometer (Analog) | **GPIO1** (ADC1_CH0) | Anemometer Signal (0–3,3V) |
-| Regenmesser (Interrupt) | GPIO12      | Regenmesser Kontakt (schließt nach GND, FALLING)     |
-| Masse           | GND          | gemeinsame Masse aller Sensoren                       |
-| Versorgung 3,3V | 3V3          | BME280 VCC, Anemometer VCC                            |
+| Funktion | Pin | Leiste/Pos. | Anschluss |
+|---|---|---|---|
+| Versorgung 3,3 V | 3V3 | rechts 3 | BME280 VCC, RS485-Modul VCC, Regenmesser (Seite A) |
+| Masse | GND | rechts 2 | alle Sensoren, RS485-Modul, **Minus des 12-V-Netzteils** |
+| I²C SCL | GP4 | links 7 | BME280 SCL |
+| I²C SDA | GP5 | links 8 | BME280 SDA |
+| Anemometer (analog) | GP1 (ADC1_CH0) | links 4 | Signal, max. 3,3 V |
+| Regenmesser | GP12 | rechts 6 | Wippe (weckt aus dem Deep Sleep) |
+| Windfahne UART1 TX | GP10 | rechts 8 | RS485-Modul, Eingang (siehe unten) |
+| Windfahne UART1 RX | GP11 | rechts 7 | RS485-Modul, Ausgang (siehe unten) |
 
-> **Hinweis zu GPIO1:** ADC1_CH0 ist am ESP32-H2 der **GPIO1** — nicht GPIO36
-> (GPIO36 kommt nur am klassischen ESP32 vor). Der Sketch ruft
-> `analogRead(GPIO1)` auf — der Arduino-Core erwartet die Pin-Nummer, das
-> ESP-IDF-Makro `ADC1_CH0` existiert dort nicht.
+## Sensoren
 
-## Windfahne (RS485, Modbus RTU)
+### BME280 (Temperatur, Luftdruck, Luftfeuchte)
 
-ComWinTop CWT-SWD, 10–30 V, Modbus RTU 4800 Baud 8N1, Adresse 1, Funktion 03.
+- VCC → 3V3, GND → GND, SCL → GP4, SDA → GP5.
+- Adresse **0x77** (SDO auf High); bei Modulen mit SDO auf Low wäre es 0x76 (`BME_ADDR`).
+- Die meisten Breakouts haben 4,7-kΩ-Pull-ups onboard, sonst je 4,7 kΩ von SDA und SCL nach 3V3.
+
+### Anemometer (Windgeschwindigkeit)
+
+- Signal → GP1, Masse → GND. Der Sketch rechnet `0–3,3 V = 0–25 m/s`.
+- Das Signal darf **3,3 V nicht überschreiten**. Bei höherer Ausgangsspannung
+  einen Spannungsteiler vorschalten:
+
+```text
+ Anemometer Signal ── 10 kΩ ──┬── GP1
+                              │
+                            6,8 kΩ
+                              │
+                             GND        (5 V → ca. 2,0 V am ADC)
+```
+
+### Regenmesser (Wippe)
+
+- Die Wippe schaltet GP12 zwischen **3V3 (Seite A)** und **GND (Seite B)** um.
+- Jeder stabile Pegelwechsel (≥ 100 ms) zählt als Kippung = 0,45 mm.
+- Kein Pull-up nötig; GP12 kann den Chip aus dem Deep Sleep wecken.
+
+### Windfahne (RS485, Modbus RTU)
+
+Windfahne mit RS485-Ausgang (10–30 V, Modbus RTU, Adresse 1, 4800 Baud 8N1).
 Der Sketch liest sie bei jedem Aufwachen über UART1 und sendet `winddir`
-(Grad, 0 = Nord). Ein RS485-TTL-Modul mit automatischer Richtungsumschaltung
-setzt die Pegel um.
+(Grad, 0 = Nord). Er probiert 4800/9600/2400 Baud und die Funktionen 03/04
+und merkt sich, was antwortet. Ein RS485-TTL-Modul mit automatischer
+Richtungsumschaltung setzt die Pegel um.
 
-| Von                  | An                          |
-|----------------------|-----------------------------|
-| ESP32-H2 GPIO10 (TX) | RS485-Modul **RXD**         |
-| ESP32-H2 GPIO11 (RX) | RS485-Modul **TXD**         |
-| ESP32-H2 3V3         | RS485-Modul VCC             |
-| ESP32-H2 GND         | RS485-Modul GND **und** Minus des 12-V-Netzteils |
-| RS485-Modul A+       | Windfahne gelb (485-A)      |
-| RS485-Modul B−       | Windfahne blau (485-B)      |
-| 12-V-Netzteil +      | Windfahne braun             |
-| 12-V-Netzteil −      | Windfahne schwarz           |
+```text
+ ESP32-H2                RS485-TTL-Modul               Windfahne
+ 3V3  (rechts 3) ─────── VCC
+ GND  (rechts 2) ─────── GND
+ GP10 (rechts 8) ─────── TXD*          A+ ─────────── gelb  (485-A)
+ GP11 (rechts 7) ─────── RXD*          B− ─────────── blau  (485-B)
+                                       (3. Klemme 地/GND: frei lassen)
+ GND ─────────────────────────────────────────┐
+                        12-V-Netzteil  − ─────┴────── schwarz
+                                       + ──────────── braun
+```
 
-- Die Windfahne braucht ein **eigenes 10–30-V-Netzteil**; keinesfalls an 3V3/5V.
-- Antwortet die Fahne nicht, A und B tauschen (die Herstellerangaben zu den
-  Aderfarben widersprechen sich) bzw. RXD/TXD am Modul tauschen.
-- Die serielle Konsole zeigt bei jedem Zyklus `Windfahne: Register 0=… 1=…`.
+\* Die Beschriftung TXD/RXD ist bei diesen Modulen uneinheitlich. Richtig ist
+die Belegung, bei der nach einem RESET (Sendeversuch) eine LED des Moduls
+blinkt. Antwortet die Windfahne, blinkt kurz danach auch die zweite LED.
+
+- **Modul-VCC an 3V3, nicht an 5V.** Bei 5 V liegt am Ausgang des Moduls 5 V
+  an GP11 an, und die 3,3-V-Pegel des H2 werden eventuell nicht erkannt.
+- Die Windfahne braucht ein **eigenes 10–30-V-Netzteil**; dessen Minus gehört
+  auf die gemeinsame GND-Schiene. Plus (braun) nie an das Modul oder den H2.
+- Aderfarben je nach Hersteller: A ist gelb oder grün, B ist blau.
+- Ruhepegel bei angeschlossenem Bus (gegen GND gemessen): A+ ≈ 3 V, B− ≈ 1 V.
+- Die serielle Konsole zeigt bei jedem Zyklus `Windfahne ...` mit den Registern
+  oder, wenn nichts zurückkommt, die empfangenen Rohbytes.
 
 ## Stromversorgung
 
-- Waveshare ESP32-H2-Zero über **USB-C** (5V) versorgen; alternativ externes 5V
-  an den 5V-Pin `[1]` rechts. Die 3V3-Schiene liefert der Onboard-LDO.
-- **BME280:** 3,3V (VCC → 3V3, GND → GND). Nicht an 5V anschließen.
-- **Anemometer:** VCC → 3V3, GND → GND, Signal → GPIO1. Das analoge Ausgangssignal
-  muss im Bereich **0–3,3V** liegen (bei 0–2,5V-Modellen direkt anschließbar; bei
-  höheren Ausgangsspannungen Spannungsteiler verwenden).
-- **Regenmesser (Tipping Bucket):** Reed-Kontakt bzw. Halbleiter-Schalter, ein
-  Anschluss auf GPIO12, der andere auf GND. Der Sketch aktiviert den internen
-  Pull-up (INPUT_PULLUP); jeder fallende Flanke (Kontakt schießt zu GND) zählt
-  einen Tipp (0,45 mm).
+- Das Modul über **USB-C** (5 V) versorgen oder alternativ 5 V an den 5V-Pin
+  (rechts 1). Die 3V3-Schiene liefert der Onboard-Regler.
+- Nur der 5V-Pin selbst verträgt 5 V; an die GPIOs gehört höchstens 3,3 V.
+- Die Windfahne hat ihr eigenes 12-V-Netzteil (gemeinsame Masse, siehe oben).
 
-## Verdrahtungsplan (ASCII)
+## Prüfen vor dem Start
 
-```
- ┌──────────────────┐        ┌──────────────────────────────────────────────┐
- │  ESP32-H2-Zero   │        │            Wetter-Sensoren                   │
- │  (linke Seite)   │        │                                              │
- │  3V3 [1] ────────┼──► 3V3-Schiene: BME280 VCC, Anemometer VCC           │
- │  GND  [2] ───────┼──► GND-Schiene: BME280, Anemometer, Regenmesser      │
- │  GPIO4 [7] ─── SCL ────► BME280 SCL (4,7k → 3V3, falls nicht onboard)    │
- │  GPIO5 [8] ─── SDA ────► BME280 SDA (4,7k → 3V3, falls nicht onboard)    │
- │  GPIO1 [4] ────────────► Anemometer Signal (0–3,3V analog)               │
- │  GPIO12[9] ────────────► Regenmesser Kontakt ──► GND (Reed, schließt      │
- │                          nach GND, FALLING)                              │
- └──────────────────┘        └──────────────────────────────────────────────┘
-```
-
-### Detaillierte Verbindungen
-
-| Von (ESP32-H2) | An                            | Kabel |
-|----------------|-------------------------------|-------|
-| 3V3            | BME280 VCC                    | rot   |
-| GND            | BME280 GND                    | schwarz |
-| GND            | Anemometer GND                | schwarz |
-| GND            | Regenmesser (ein Anschluss)   | schwarz |
-| GPIO4          | BME280 SCL                    | gelb  |
-| GPIO5          | BME280 SDA                    | blau  |
-| GPIO1 (ADC1_CH0) | Anemometer Signal           | grün  |
-| GPIO12         | Regenmesser (anderer Anschluss) | weiß |
-
-## Prüfwerte vor dem Start
-
-1. **BME280:** dieses Modul antwortet auf I²C-Adresse `0x77` (SDO auf High). Der
-   Sketch nutzt `BME_ADDR` (`0x77`); bei Modulen mit SDO auf Low wäre es `0x76`.
-   Beide Adressen sind mit dem Multi-Pin-I²C-Scan ermittelt worden.
-2. **I²C Pull-ups:** Die meisten BME280-Breakouts haben 4,7k schon onboard. Wenn
-   du das nackte Sensormodul verwendest: 4,7k von SDA nach 3V3 und von SCL nach
-   3V3 löten.
-3. **Anemometer:** Das Signal muss beim Betrieb zwischen 0 und 3,3V liegen.
-   Bei Modellen mit 0–2,5V/Vollbereich ist das OK; bei 5V-Ausgang den
-   Spannungsteiler (z. B. 10k/6,8k) anbringen, sonst ADC-Überlastung.
-4. **Regenmesser:** Beim Umlegen des Kippkontakts muss die Flanke auf GPIO12 von
-   HIGH auf LOW gehen (interner Pull-up). Bei manchen Wetterstation-Kontakten ist
-   zusätzlich ein externer Pull-up (10k gegen 3V3) sinnvoll.
-
-## Spannungsteiler-Anemometer (nur falls nötig)
-
-```
- GPIO1 ─────┬──── 10 kΩ ──── Anemometer Signal
-            │
-            6,8 kΩ
-            │
-           GND
- (Verhältnis ≈ 0,405 → 5V max => ~2,0V am ADC)
-```
-
-Hinweis: Der Sketch skaliert mit `(v / 4095.0) * 3.3 * 25` und geht von einem
-Vollbereich von 25 m/s bei 3,3V aus. Passt das Teilersignal dazu, bleibt die
-Windmessung korrekt.
+1. Mit dem Multimeter an **jedem belegten GPIO gegen GND**: höchstens 3,3 V.
+2. 3V3 gegen GND: ca. 3,3 V; 5V gegen GND: ca. 5 V (bei USB-Versorgung).
+3. Windfahne: braun gegen schwarz 10–30 V; A+/B− gegen GND im Ruhezustand ca. 3 V / 1 V.
+4. Nach RESET bleibt der Knoten 30 s wach – in diesem Fenster flashen und die
+   Konsole lesen.

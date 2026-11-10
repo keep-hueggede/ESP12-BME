@@ -77,8 +77,8 @@
 #define BME_ADDR 0x77      // BME280 antwortet auf 0x77 (statt Default 0x76)
 #define ANEMOMETER 1       // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
 #define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
-#define VANE_TX 10         // UART1 TX -> RS485 module RXD
-#define VANE_RX 11         // UART1 RX <- RS485 module TXD
+#define VANE_TX 10         // UART1 TX -> RS485 module input (labelled TXD or RXD, see Schaltplan.md)
+#define VANE_RX 11         // UART1 RX <- RS485 module output
 // CWT-SWD wind vane: Modbus RTU 8N1, address 1, 4800 baud by default (2400/9600 selectable)
 #define VANE_ADDR 1
 #define VANE_TIMEOUT_MS 300
