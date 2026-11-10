@@ -50,7 +50,7 @@ BME280 SDA GP5 [8]  │        GP10 │ [8]  GP10 (TX)  -> RS485-Modul
 ### BME280 (Temperatur, Luftdruck, Luftfeuchte)
 
 - VCC → 3V3, GND → GND, SCL → GP4, SDA → GP5.
-- Adresse **0x77** (SDO auf High); bei Modulen mit SDO auf Low wäre es 0x76 (`BME_ADDR`).
+- Adresse **0x77** (SDO auf High) oder **0x76** (SDO auf Low); die Firmware probiert beide.
 - Die meisten Breakouts haben 4,7-kΩ-Pull-ups onboard, sonst je 4,7 kΩ von SDA und SCL nach 3V3.
 
 ### Anemometer (Windgeschwindigkeit)

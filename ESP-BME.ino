@@ -74,7 +74,7 @@
 #define SEALEVELPRESSURE_HPA (1013.25)
 #define I2C_SDA 5          // BME280 real an GPIO5 (SDA), ermittelt per Bus-Scan
 #define I2C_SCL 4          // BME280 real an GPIO4 (SCL), ermittelt per Bus-Scan
-#define BME_ADDR 0x77      // BME280 antwortet auf 0x77 (statt Default 0x76)
+#define BME_ADDR 0x77      // SDO high; with SDO low the module answers on 0x76 (tried as fallback)
 #define ANEMOMETER 1       // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
 #define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
 #define VANE_TX 10         // UART1 TX -> RS485 module input (labelled TXD or RXD, see Schaltplan.md)
@@ -596,7 +596,7 @@ void setup() {
   pinMode(I2C_SDA, INPUT_PULLUP);
   pinMode(I2C_SCL, INPUT_PULLUP);
   I2CBME.begin(I2C_SDA, I2C_SCL, 100000);
-  g_bmeOk = bme.begin(BME_ADDR, &I2CBME);
+  g_bmeOk = bme.begin(BME_ADDR, &I2CBME) || bme.begin(0x76, &I2CBME);
   if (g_bmeOk) {
     bme.setSampling(Adafruit_BME280::MODE_FORCED, Adafruit_BME280::SAMPLING_X1, Adafruit_BME280::SAMPLING_X1,
                     Adafruit_BME280::SAMPLING_X1, Adafruit_BME280::FILTER_OFF);
