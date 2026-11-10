@@ -254,9 +254,9 @@ static size_t  g_rxLen = 0;
 
 // Modbus RTU function 03 (read holding registers). Searches the received bytes for
 // the reply, so a module that echoes the request does not matter.
-static bool modbusRead(HardwareSerial &port, uint8_t addr, uint16_t reg, uint8_t count, uint16_t *out,
+static bool modbusRead(HardwareSerial &port, uint8_t fn, uint8_t addr, uint16_t reg, uint8_t count, uint16_t *out,
                        uint32_t timeoutMs = VANE_TIMEOUT_MS) {
-  uint8_t req[8] = { addr, 0x03, (uint8_t)(reg >> 8), (uint8_t)reg, 0, count };
+  uint8_t req[8] = { addr, fn, (uint8_t)(reg >> 8), (uint8_t)reg, 0, count };
   uint16_t crc = modbusCrc(req, 6);
   req[6] = crc & 0xFF;
   req[7] = crc >> 8;
@@ -272,7 +272,7 @@ static bool modbusRead(HardwareSerial &port, uint8_t addr, uint16_t reg, uint8_t
     if (g_rxLen < sizeof(g_rx)) g_rx[g_rxLen++] = port.read(); else port.read();
     if (g_rxLen < want) continue;
     const uint8_t *f = g_rx + g_rxLen - want;
-    if (f[0] == addr && f[1] == 0x03 && f[2] == 2 * count
+    if (f[0] == addr && f[1] == fn && f[2] == 2 * count
         && modbusCrc(f, want - 2) == (uint16_t)(f[want - 2] | (f[want - 1] << 8))) {
       for (int i = 0; i < count; i++) out[i] = (f[3 + 2 * i] << 8) | f[4 + 2 * i];
       return true;
@@ -289,8 +289,10 @@ static void printRx() {
 
 // Register 0 = sector 0-7 (N, NE, ...), register 1 = angle 0-360 on the 360 degree model.
 // The angle is only trusted if it lies in the reported sector.
-// Tries the vane's selectable baud rates and remembers the one that answered.
+// Tries the vane's selectable baud rates and both read functions (03 holding,
+// 04 input registers; vendors differ) and remembers the combination that answered.
 RTC_DATA_ATTR static uint8_t rtcVaneBaud = 0;
+RTC_DATA_ATTR static uint8_t rtcVaneFn = 0x03;
 static void readVane() {
   static const uint32_t bauds[] = { 4800, 9600, 2400 };
   HardwareSerial vane(1);
@@ -298,22 +300,29 @@ static void readVane() {
   for (int k = 0; k < 3; k++) {
     uint8_t idx = (rtcVaneBaud + k) % 3;
     vane.begin(bauds[idx], SERIAL_8N1, VANE_RX, VANE_TX);
-    if (modbusRead(vane, VANE_ADDR, 0x0000, 2, r)) {
-      Serial.printf("Windfahne (%lu Baud): Register 0=%u 1=%u\n", (unsigned long)bauds[idx], r[0], r[1]);
-      if (r[1] <= 360 && ((r[1] + 22) / 45) % 8 == r[0]) g_windDir = r[1] % 360;
-      else if (r[0] < 8) g_windDir = r[0] * 45;
-    } else if (modbusRead(vane, VANE_ADDR, 0x0000, 1, r)) {
-      Serial.printf("Windfahne (%lu Baud): Register 0=%u\n", (unsigned long)bauds[idx], r[0]);
-      if (r[0] < 8) g_windDir = r[0] * 45;
-    } else {
-      Serial.printf("Windfahne antwortet nicht bei %lu Baud. ", (unsigned long)bauds[idx]);
+    for (int j = 0; j < 2; j++) {
+      uint8_t fn = j == 0 ? rtcVaneFn : (rtcVaneFn == 0x03 ? 0x04 : 0x03);
+      bool ok = false;
+      if (modbusRead(vane, fn, VANE_ADDR, 0x0000, 2, r)) {
+        Serial.printf("Windfahne (%lu Baud, Fkt %02X): Register 0=%u 1=%u\n", (unsigned long)bauds[idx], fn, r[0], r[1]);
+        if (r[1] <= 360 && ((r[1] + 22) / 45) % 8 == r[0]) g_windDir = r[1] % 360;
+        else if (r[0] < 8) g_windDir = r[0] * 45;
+        ok = true;
+      } else if (modbusRead(vane, fn, VANE_ADDR, 0x0000, 1, r)) {
+        Serial.printf("Windfahne (%lu Baud, Fkt %02X): Register 0=%u\n", (unsigned long)bauds[idx], fn, r[0]);
+        if (r[0] < 8) g_windDir = r[0] * 45;
+        ok = true;
+      }
+      if (ok) {
+        rtcVaneBaud = idx;
+        rtcVaneFn = fn;
+        vane.end();
+        return;
+      }
+      Serial.printf("Windfahne antwortet nicht bei %lu Baud, Fkt %02X. ", (unsigned long)bauds[idx], fn);
       printRx();
-      vane.end();
-      continue;
     }
-    rtcVaneBaud = idx;
     vane.end();
-    return;
   }
 }
 
