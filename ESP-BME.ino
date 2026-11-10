@@ -76,6 +76,10 @@
 #define I2C_SCL 4          // BME280 real an GPIO4 (SCL), ermittelt per Bus-Scan
 #define BME_ADDR 0x77      // SDO high; with SDO low the module answers on 0x76 (tried as fallback)
 #define ANEMOMETER 1       // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
+// Funduino cup anemometer (generator, 0-2 V): wind speed = voltage * 25 m/s
+#define WIND_MS_PER_VOLT 25.0f
+#define WIND_SAMPLE_MS 3000      // averaging window per wake; the maximum is the gust
+#define WIND_SAMPLE_STEP_MS 50
 #define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
 #define VANE_TX 10         // UART1 TX -> RS485 module input (labelled TXD or RXD, see Schaltplan.md)
 #define VANE_RX 11         // UART1 RX <- RS485 module output
@@ -151,7 +155,8 @@ RTC_DATA_ATTR static uint32_t          rtcFailed = 0;
 // --------------------------------------------------------------------------
 static bool  g_bmeOk = false;
 static float g_temp, g_press, g_alt, g_hum;
-static float g_wind = 0.0f;     // m/s
+static float g_wind = 0.0f;     // m/s, mean over WIND_SAMPLE_MS
+static float g_gust = 0.0f;     // m/s, highest sample in that window
 static float g_battery = NAN;   // V
 static int   g_windDir = -1;    // degrees 0-359, -1 = vane not answering
 static char  g_hwId[17] = "unknown";
@@ -239,7 +244,7 @@ static void goToSleep() {
 
 // --------------------------------------------------------------------------
 // Messen: BME280 im Forced Mode (eine Messung, danach schlaeft der Sensor),
-// Anemometer und Batterie als kurze Mittelwerte.
+// Anemometer gemittelt ueber WIND_SAMPLE_MS (Maximum = Boe), Batterie als kurzer Mittelwert.
 // --------------------------------------------------------------------------
 static uint16_t modbusCrc(const uint8_t *data, size_t len) {
   uint16_t crc = 0xFFFF;
@@ -336,10 +341,20 @@ static void measure() {
     g_hum   = bme.readHumidity();
   }
 
-  uint32_t sum = 0;
-  for (int i = 0; i < 8; i++) sum += analogRead(ANEMOMETER);
-  // ESP32-H2: 12-bit ADC (0-4095), 3.3V Referenz, Vollbereich = 25 m/s
-  g_wind = (sum / 8.0f / 4095.0f) * 3.3f * 25.0f;
+  // calibrated millivolts, each sample the mean of 4 reads against ADC noise
+  uint32_t sumMv = 0, maxMv = 0, n = 0;
+  uint32_t start = millis();
+  while (millis() - start < WIND_SAMPLE_MS) {
+    uint32_t mv = 0;
+    for (int i = 0; i < 4; i++) mv += analogReadMilliVolts(ANEMOMETER);
+    mv /= 4;
+    sumMv += mv;
+    if (mv > maxMv) maxMv = mv;
+    n++;
+    delay(WIND_SAMPLE_STEP_MS);
+  }
+  g_wind = sumMv / (float)n / 1000.0f * WIND_MS_PER_VOLT;
+  g_gust = maxMv / 1000.0f * WIND_MS_PER_VOLT;
 
   if (VANE_ENABLED) readVane();
 
@@ -360,8 +375,8 @@ static void buildJson(char *buf, size_t len, uint32_t tips) {
     n += snprintf(buf + n, len - n, ",\"temp\":%.2f,\"pressure\":%.2f,\"altitude\":%.2f,\"humidity\":%.2f",
                   (double)g_temp, (double)g_press, (double)g_alt, (double)g_hum);
   }
-  n += snprintf(buf + n, len - n, ",\"wind\":%.2f,\"rain\":%.2f,\"tips\":%lu",
-                (double)g_wind, tips * RAIN_MM_PER_TIP, (unsigned long)tips);
+  n += snprintf(buf + n, len - n, ",\"wind\":%.2f,\"gust\":%.2f,\"rain\":%.2f,\"tips\":%lu",
+                (double)g_wind, (double)g_gust, tips * RAIN_MM_PER_TIP, (unsigned long)tips);
   if (g_windDir >= 0) n += snprintf(buf + n, len - n, ",\"winddir\":%d", g_windDir);
   if (!isnan(g_battery)) n += snprintf(buf + n, len - n, ",\"battery\":%.2f", (double)g_battery);
   snprintf(buf + n, len - n, ",\"fw\":\"%s\"}", FW_VERSION);
