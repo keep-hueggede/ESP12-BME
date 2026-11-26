@@ -62,6 +62,9 @@
 #include "esp_sleep.h"
 #include "esp_ota_ops.h"
 #include "mbedtls/sha256.h"
+#include "soc/gpio_reg.h"
+#include "Cc1101.h"
+#include "TfaWind.h"
 
 // Set by the release build (-DFW_VERSION=\"1.2.0\"); local builds never get replaced
 #ifndef FW_VERSION
@@ -82,6 +85,16 @@
 #define WIND_SAMPLE_STEP_MS 50
 #define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
 #define LED_PIN 8          // Onboard-WS2812B (RGB-LED) - wird bei jedem Mess-Zyklus schwarz gesetzt
+
+// CC1101 433 MHz receiver for the TFA 30.3251.10 wind sender (wind direction)
+#define CC_SCK  10
+#define CC_MOSI 11
+#define CC_MISO 13
+#define CC_CS   14
+#define CC_GDO0 3          // demodulated OOK signal
+#define TFA_LISTEN_MS     35000   // the sender transmits about every 30 s
+#define TFA_LEAD_MS       2000    // wake this long before the next expected packet
+#define TFA_REPAIR_MISSES 6       // wakes without our sender before pairing anew
 
 // Regenmesser: 1 Kippung = 0.45 mm. Jeder stabile Pegelwechsel ist eine Kippung.
 #define RAIN_MM_PER_TIP 0.45
@@ -143,6 +156,10 @@ RTC_DATA_ATTR static volatile uint32_t rtcTipsPending = 0;  // not yet acknowled
 RTC_DATA_ATTR static int64_t           rtcNextReportUs = 0;
 RTC_DATA_ATTR static uint32_t          rtcSent = 0;
 RTC_DATA_ATTR static uint32_t          rtcFailed = 0;
+// wind sender id; a RESET clears it, then the first sender heard is paired
+RTC_DATA_ATTR static bool              rtcTfaPaired = false;
+RTC_DATA_ATTR static uint32_t          rtcTfaId = 0;
+RTC_DATA_ATTR static uint8_t           rtcTfaMisses = 0;
 
 // --------------------------------------------------------------------------
 // Messwerte dieser Wachphase
@@ -162,6 +179,15 @@ OThreadCoAPClient coap;
 static esp_timer_handle_t rainTimer = nullptr;
 static bool g_stayAwake = false;
 static uint32_t g_awakeUntilMs = 0;
+
+static Cc1101 radio(CC_SCK, CC_MISO, CC_MOSI, CC_CS);
+static TfaWindDecoder tfaDecoder;
+static TfaWindReading g_tfaIsrReading;   // written by the ISR, read under noInterrupts()
+static volatile bool g_tfaNew = false;
+static volatile uint32_t g_tfaLastEdgeUs = 0;
+static volatile uint32_t g_tfaEdges = 0;
+static bool g_radioOk = false;
+static int64_t g_tfaPacketUs = 0;        // wall time of this wake's packet, 0 = none
 
 // --------------------------------------------------------------------------
 // Hilfsfunktionen
@@ -240,7 +266,74 @@ static void goToSleep() {
 // Messen: BME280 im Forced Mode (eine Messung, danach schlaeft der Sensor),
 // Anemometer gemittelt ueber WIND_SAMPLE_MS (Maximum = Boe), Batterie als kurzer Mittelwert.
 // --------------------------------------------------------------------------
+// Each edge on GDO0 ends a level; the decoder gets that level and its duration
+static void IRAM_ATTR onRadioEdge() {
+  uint32_t now = (uint32_t)esp_timer_get_time();
+  uint32_t dur = now - g_tfaLastEdgeUs;
+  g_tfaLastEdgeUs = now;
+  g_tfaEdges = g_tfaEdges + 1;
+  bool levelNow = (REG_READ(GPIO_IN_REG) >> CC_GDO0) & 1;
+  if (tfaDecoder.pulse(!levelNow, dur)) {
+    g_tfaIsrReading = tfaDecoder.reading();
+    g_tfaNew = true;
+  }
+}
+
+static void radioStart() {
+  g_radioOk = radio.begin();
+  if (!g_radioOk) {
+    Serial.printf("CC1101 antwortet nicht (PARTNUM %02X, VERSION %02X) - Verdrahtung pruefen\n",
+                  radio.partnum(), radio.version());
+    return;
+  }
+  radio.receive();
+  pinMode(CC_GDO0, INPUT);
+  attachInterrupt(CC_GDO0, onRadioEdge, CHANGE);
+  Serial.printf("CC1101 bereit (VERSION %02X)\n", radio.version());
+}
+
+// True once a packet of our sender arrived; pairs with the first sender heard after a RESET
+static bool radioPoll() {
+  if (!g_radioOk || !g_tfaNew) return false;
+  noInterrupts();
+  TfaWindReading r = g_tfaIsrReading;
+  g_tfaNew = false;
+  interrupts();
+  if (rtcTfaPaired && r.id != rtcTfaId) {
+    Serial.printf("Fremder Windsender %05lX ignoriert\n", (unsigned long)r.id);
+    return false;
+  }
+  if (!rtcTfaPaired) {
+    rtcTfaPaired = true;
+    rtcTfaId = r.id;
+    Serial.printf("Windsender %05lX gekoppelt\n", (unsigned long)r.id);
+  }
+  g_tfaPacketUs = nowUs();
+  g_windDir = r.direction;
+  Serial.printf("Windsender %05lX: Richtung %u Grad, Geschwindigkeit roh %.1f, Batterie %s\n", (unsigned long)r.id,
+                r.direction, r.speedX10 / 10.0, r.batteryLow ? "schwach" : "ok");
+  return true;
+}
+
+static void radioStop() {
+  if (!g_radioOk) return;
+  detachInterrupt(CC_GDO0);
+  radio.sleep();
+  if (g_tfaPacketUs) {
+    rtcTfaMisses = 0;
+    return;
+  }
+  Serial.printf("Kein Windsender empfangen (%lu Flanken)\n", (unsigned long)g_tfaEdges);
+  if (rtcTfaPaired && ++rtcTfaMisses >= TFA_REPAIR_MISSES) {
+    rtcTfaPaired = false;
+    Serial.println("Windsender lange nicht gehoert - naechster gehoerter wird gekoppelt");
+  }
+}
+
 static void measure() {
+  radioStart();
+  uint32_t listenStart = millis();
+
   if (g_bmeOk) {
     bme.takeForcedMeasurement();
     g_temp  = bme.readTemperature();
@@ -259,10 +352,17 @@ static void measure() {
     sumMv += mv;
     if (mv > maxMv) maxMv = mv;
     n++;
+    if (!g_tfaPacketUs) radioPoll();
     delay(WIND_SAMPLE_STEP_MS);
   }
   g_wind = sumMv / (float)n / 1000.0f * WIND_MS_PER_VOLT;
   g_gust = maxMv / 1000.0f * WIND_MS_PER_VOLT;
+
+  while (g_radioOk && !g_tfaPacketUs && millis() - listenStart < TFA_LISTEN_MS) {
+    radioPoll();
+    delay(10);
+  }
+  radioStop();
 
 
 #if BATTERY_ENABLED
@@ -528,7 +628,9 @@ void setup() {
   }
 
   measure();
-  rtcNextReportUs = nowUs() + (int64_t)reportIntervalS() * 1000000LL;
+  // align the next wake with the wind sender's rhythm (interval = multiple of ~30 s)
+  int64_t base = g_tfaPacketUs ? g_tfaPacketUs - TFA_LEAD_MS * 1000LL : nowUs();
+  rtcNextReportUs = base + (int64_t)reportIntervalS() * 1000000LL;
 
   coap.setTimeout(COAP_TIMEOUT_MS);
   if (joinNetwork() && pushMeasurement()) {
