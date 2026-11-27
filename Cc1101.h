@@ -65,6 +65,7 @@ public:
 
   uint8_t partnum() const { return partnum_; }
   uint8_t version() const { return version_; }
+  uint8_t state() { return status(0x35) & 0x1F; }   // MARCSTATE, 0x0D = RX
 
 private:
   enum { SRES = 0x30, SRX = 0x34, SIDLE = 0x36, SPWD = 0x39 };

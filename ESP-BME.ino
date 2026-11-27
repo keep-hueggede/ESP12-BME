@@ -316,12 +316,13 @@ static bool radioPoll() {
 static void radioStop() {
   if (!g_radioOk) return;
   detachInterrupt(CC_GDO0);
+  uint8_t state = radio.state();
   radio.sleep();
   if (g_tfaPacketUs) {
     rtcTfaMisses = 0;
     return;
   }
-  Serial.printf("Kein Windsender empfangen (%lu Flanken)\n", (unsigned long)g_tfaEdges);
+  Serial.printf("Kein Windsender empfangen (%lu Flanken, CC1101-Zustand %02X)\n", (unsigned long)g_tfaEdges, state);
   if (rtcTfaPaired && ++rtcTfaMisses >= TFA_REPAIR_MISSES) {
     rtcTfaPaired = false;
     Serial.println("Windsender lange nicht gehoert - naechster gehoerter wird gekoppelt");
