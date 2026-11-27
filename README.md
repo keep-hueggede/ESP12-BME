@@ -12,7 +12,7 @@ leitet sie weiter (z. B. in eine Datenbank).
 | Temperatur (°C) | BME280 (I²C) | `/weather/temp` |
 | Luftfeuchte (%) | BME280 (I²C) | `/weather/humidity` |
 | Luftdruck (hPa) | BME280 (I²C) | `/weather/pressure` |
-| Windgeschwindigkeit (m/s) | Anemometer (ADC1_CH0) | `/weather/all` (JSON) |
+| Windgeschwindigkeit (m/s), Windrichtung (°) | Funk-Windsender TFA 30.3251.10 über CC1101 (433 MHz) | `/weather/all` (JSON) |
 | Regenmenge (mm, kumuliert) | Regenmesser (Interrupt) | `/weather/all` (JSON) |
 
 Ein kombinierter JSON-Endpoint `/weather/all` liefert alle fünf Messgrößen in einem
@@ -24,13 +24,13 @@ GET (idealer Endpoint für einen DB-Schreiber ert über dem OTBR).
 |----------|------|
 | I²C SDA (BME280) | 5 |
 | I²C SCL (BME280) | 4 |
-| Anemometer (Analog, ADC1_CH0) | 1 |
+| CC1101 SCK / MOSI / MISO / CSN / GDO0 | 10 / 11 / 13 / 14 / 3 |
 | Regenmesser (Wippe, jede Flanke = 1 Kippung) | 12 |
 
 ## Verdrahtung
 
 - BME280 VCC → 3.3V, GND → GND, SDA → GPIO5, SCL → GPIO4 (I²C-Adresse `0x77`)
-- Anemometer Signal → GPIO1 (ADC1_CH0, bei Bedarf mit Pull-Down)
+- CC1101 (433 MHz) → siehe `Schaltplan.md`
 - Regenmesser: Signal → GPIO12 (3 V / 0 V, jeder stabile Pegelwechsel = 1 Kippung), GND → GND
 
 ## Kommunikationsarchitektur

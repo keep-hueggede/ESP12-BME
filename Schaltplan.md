@@ -16,7 +16,7 @@ Draufsicht, USB-C oben. Gezählt wird je Leiste von oben nach unten.
           GP24 [1]  │ TX       5V │ [1]  5V
           GP23 [2]  │ RX      GND │ [2]  GND        <- GND-Schiene
           GP0  [3]  │         3V3 │ [3]  3V3        <- 3V3-Schiene
-Anemometer GP1 [4]  │        GP14 │ [4]  GP14       -> CC1101 CSN
+          GP1  [4]  │        GP14 │ [4]  GP14       -> CC1101 CSN
           GP2  [5]  │        GP13 │ [5]  GP13       <- CC1101 MISO
 CC1101 GDO0 GP3 [6] │        GP12 │ [6]  GP12       <- Regenmesser
 BME280 SCL GP4 [7]  │        GP11 │ [7]  GP11       -> CC1101 MOSI
@@ -39,7 +39,6 @@ BME280 SDA GP5 [8]  │        GP10 │ [8]  GP10       -> CC1101 SCK
 | Masse | GND | rechts 2 | alle Sensoren, CC1101 |
 | I²C SCL | GP4 | links 7 | BME280 SCL |
 | I²C SDA | GP5 | links 8 | BME280 SDA |
-| Anemometer (analog) | GP1 (ADC1_CH0) | links 4 | Signal, max. 3,3 V |
 | Regenmesser | GP12 | rechts 6 | Wippe (weckt aus dem Deep Sleep) |
 | CC1101 SCK | GP10 | rechts 8 | SPI-Takt |
 | CC1101 MOSI (SI) | GP11 | rechts 7 | SPI-Daten zum Modul |
@@ -55,38 +54,19 @@ BME280 SDA GP5 [8]  │        GP10 │ [8]  GP10       -> CC1101 SCK
 - Adresse **0x77** (SDO auf High) oder **0x76** (SDO auf Low); die Firmware probiert beide.
 - Die meisten Breakouts haben 4,7-kΩ-Pull-ups onboard, sonst je 4,7 kΩ von SDA und SCL nach 3V3.
 
-### Anemometer (Windgeschwindigkeit)
-
-Funduino-Schalenanemometer: ein kleiner Generator, **keine Versorgung nötig**.
-Ausgang 0–2 V, Windgeschwindigkeit = Spannung × 25 m/s.
-
-- Signal → GP1, Masse → GND, **direkt, ohne Spannungsteiler** (2 V < 3,3 V).
-- Der Sketch mittelt bei jedem Aufwachen 3 s lang (`wind`) und meldet den
-  höchsten Wert in diesem Fenster als Böe (`gust`).
-- Bei Windstille sind Werte um 0 normal.
-- Wird das Schalenkreuz rückwärts gedreht, kehrt der Generator die Polarität um.
-  Schutz für GP1, falls das vorkommen kann:
-
-```text
- Anemometer Signal ── 1 kΩ ──┬── GP1
-                             │
-                          Schottky-Diode (Kathode an GP1)
-                             │
-                            GND
-```
-
 ### Regenmesser (Wippe)
 
 - Die Wippe schaltet GP12 zwischen **3V3 (Seite A)** und **GND (Seite B)** um.
 - Jeder stabile Pegelwechsel (≥ 100 ms) zählt als Kippung = 0,45 mm.
 - Kein Pull-up nötig; GP12 kann den Chip aus dem Deep Sleep wecken.
 
-### Windrichtung (TFA 30.3251.10 über CC1101, 433 MHz)
+### Wind (TFA 30.3251.10 über CC1101, 433 MHz)
 
 Der Funk-Windsender TFA 30.3251.10 (Protokoll LaCrosse TX141W) sendet etwa
 alle 30 s Windrichtung und -geschwindigkeit auf 433,92 MHz. Ein CC1101-Modul
-empfängt das Signal; der Sketch dekodiert es und sendet `winddir`
-(Grad, 0 = Nord). Er koppelt sich nach einem RESET an den ersten gehörten
+empfängt das Signal; der Sketch dekodiert es und sendet `wind` (m/s),
+`winddir` (Grad, 0 = Nord) und `windbatlow` (1 = Batterie des Senders schwach).
+Ohne empfangenes Paket fehlen diese Werte in der Meldung. Er koppelt sich nach einem RESET an den ersten gehörten
 Sender und ignoriert danach fremde Sender.
 
 ```text
