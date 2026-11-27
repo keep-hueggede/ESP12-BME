@@ -87,7 +87,10 @@
 #define CC_MISO 13
 #define CC_CS   14
 #define CC_GDO0 3          // demodulated OOK signal
-#define TFA_LISTEN_MS     35000   // the sender transmits about every 30 s
+#ifndef TFA_DEBUG
+#define TFA_DEBUG 0               // 1 = log edges, pulse-like edges and peak RSSI every second
+#endif
+#define TFA_LISTEN_MS     (TFA_DEBUG ? 65000 : 35000)   // the sender transmits about every 30 s
 #define TFA_LEAD_MS       2000    // wake this long before the next expected packet
 #define TFA_REPAIR_MISSES 6       // wakes without our sender before pairing anew
 
@@ -182,6 +185,7 @@ static TfaWindReading g_tfaIsrReading;   // written by the ISR, read under noInt
 static volatile bool g_tfaNew = false;
 static volatile uint32_t g_tfaLastEdgeUs = 0;
 static volatile uint32_t g_tfaEdges = 0;
+static volatile uint32_t g_tfaPulses = 0;   // edges with a plausible pulse length
 static bool g_radioOk = false;
 static int64_t g_tfaPacketUs = 0;        // wall time of this wake's packet, 0 = none
 
@@ -268,6 +272,7 @@ static void IRAM_ATTR onRadioEdge() {
   uint32_t dur = now - g_tfaLastEdgeUs;
   g_tfaLastEdgeUs = now;
   g_tfaEdges = g_tfaEdges + 1;
+  if (dur >= 120 && dur < 1000) g_tfaPulses = g_tfaPulses + 1;
   bool levelNow = (REG_READ(GPIO_IN_REG) >> CC_GDO0) & 1;
   if (tfaDecoder.pulse(!levelNow, dur)) {
     g_tfaIsrReading = tfaDecoder.reading();
@@ -341,9 +346,23 @@ static void measure() {
     g_hum   = bme.readHumidity();
   }
 
+  uint32_t dbgSecond = millis(), dbgEdges = 0, dbgPulses = 0;
+  int dbgRssi = -200;
   while (g_radioOk && !g_tfaPacketUs && millis() - listenStart < TFA_LISTEN_MS) {
     radioPoll();
     delay(10);
+    if (TFA_DEBUG) {
+      int r = radio.rssi();
+      if (r > dbgRssi) dbgRssi = r;
+      if (millis() - dbgSecond >= 1000) {
+        Serial.printf("  t=%2lus Flanken %4lu Pulse %4lu RSSI max %d dBm\n", (unsigned long)((millis() - listenStart) / 1000),
+                      (unsigned long)(g_tfaEdges - dbgEdges), (unsigned long)(g_tfaPulses - dbgPulses), dbgRssi);
+        dbgSecond = millis();
+        dbgEdges = g_tfaEdges;
+        dbgPulses = g_tfaPulses;
+        dbgRssi = -200;
+      }
+    }
   }
   radioStop();
 
