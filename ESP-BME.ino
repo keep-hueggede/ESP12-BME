@@ -78,15 +78,10 @@
 #define I2C_SDA 5          // BME280 real an GPIO5 (SDA), ermittelt per Bus-Scan
 #define I2C_SCL 4          // BME280 real an GPIO4 (SCL), ermittelt per Bus-Scan
 #define BME_ADDR 0x77      // SDO high; with SDO low the module answers on 0x76 (tried as fallback)
-#define ANEMOMETER 1       // GPIO1 = ADC1_CH0 am ESP32-H2, analogRead nimmt die Pin-Nummer
-// Funduino cup anemometer (generator, 0-2 V): wind speed = voltage * 25 m/s
-#define WIND_MS_PER_VOLT 25.0f
-#define WIND_SAMPLE_MS 3000      // averaging window per wake; the maximum is the gust
-#define WIND_SAMPLE_STEP_MS 50
 #define RAIN_PIN 12        // Regenmesser (Wippe: Seite A = 3 V, Seite B = 0 V); GPIO7-14 koennen wecken
 #define LED_PIN 8          // Onboard-WS2812B (RGB-LED) - wird bei jedem Mess-Zyklus schwarz gesetzt
 
-// CC1101 433 MHz receiver for the TFA 30.3251.10 wind sender (wind direction)
+// CC1101 433 MHz receiver for the TFA 30.3251.10 wind sender (speed, direction, battery)
 #define CC_SCK  10
 #define CC_MOSI 11
 #define CC_MISO 13
@@ -166,10 +161,11 @@ RTC_DATA_ATTR static uint8_t           rtcTfaMisses = 0;
 // --------------------------------------------------------------------------
 static bool  g_bmeOk = false;
 static float g_temp, g_press, g_alt, g_hum;
-static float g_wind = 0.0f;     // m/s, mean over WIND_SAMPLE_MS
-static float g_gust = 0.0f;     // m/s, highest sample in that window
 static float g_battery = NAN;   // V
-static int   g_windDir = -1;    // degrees 0-359, -1 = no wind sender heard
+// wind sender values; only sent when a packet arrived in this wake
+static float g_wind = 0.0f;     // m/s
+static int   g_windDir = -1;    // degrees 0-359
+static bool  g_windBatLow = false;
 static char  g_hwId[17] = "unknown";
 static char  g_reply[200] = "";   // collector's answer to the last report (may hold an update offer)
 
@@ -264,7 +260,7 @@ static void goToSleep() {
 
 // --------------------------------------------------------------------------
 // Messen: BME280 im Forced Mode (eine Messung, danach schlaeft der Sensor),
-// Anemometer gemittelt ueber WIND_SAMPLE_MS (Maximum = Boe), Batterie als kurzer Mittelwert.
+// Wind vom Funk-Windsender (CC1101), Batterie als kurzer Mittelwert.
 // --------------------------------------------------------------------------
 // Each edge on GDO0 ends a level; the decoder gets that level and its duration
 static void IRAM_ATTR onRadioEdge() {
@@ -310,8 +306,10 @@ static bool radioPoll() {
   }
   g_tfaPacketUs = nowUs();
   g_windDir = r.direction;
-  Serial.printf("Windsender %05lX: Richtung %u Grad, Geschwindigkeit roh %.1f, Batterie %s\n", (unsigned long)r.id,
-                r.direction, r.speedX10 / 10.0, r.batteryLow ? "schwach" : "ok");
+  g_wind = r.speedX10 / 36.0f;   // sender reports km/h x 10
+  g_windBatLow = r.batteryLow;
+  Serial.printf("Windsender %05lX: %.1f m/s aus %u Grad, Batterie %s\n", (unsigned long)r.id, (double)g_wind,
+                r.direction, r.batteryLow ? "schwach" : "ok");
   return true;
 }
 
@@ -342,28 +340,11 @@ static void measure() {
     g_hum   = bme.readHumidity();
   }
 
-  // calibrated millivolts, each sample the mean of 4 reads against ADC noise
-  uint32_t sumMv = 0, maxMv = 0, n = 0;
-  uint32_t start = millis();
-  while (millis() - start < WIND_SAMPLE_MS) {
-    uint32_t mv = 0;
-    for (int i = 0; i < 4; i++) mv += analogReadMilliVolts(ANEMOMETER);
-    mv /= 4;
-    sumMv += mv;
-    if (mv > maxMv) maxMv = mv;
-    n++;
-    if (!g_tfaPacketUs) radioPoll();
-    delay(WIND_SAMPLE_STEP_MS);
-  }
-  g_wind = sumMv / (float)n / 1000.0f * WIND_MS_PER_VOLT;
-  g_gust = maxMv / 1000.0f * WIND_MS_PER_VOLT;
-
   while (g_radioOk && !g_tfaPacketUs && millis() - listenStart < TFA_LISTEN_MS) {
     radioPoll();
     delay(10);
   }
   radioStop();
-
 
 #if BATTERY_ENABLED
   uint32_t mv = 0;
@@ -382,9 +363,11 @@ static void buildJson(char *buf, size_t len, uint32_t tips) {
     n += snprintf(buf + n, len - n, ",\"temp\":%.2f,\"pressure\":%.2f,\"altitude\":%.2f,\"humidity\":%.2f",
                   (double)g_temp, (double)g_press, (double)g_alt, (double)g_hum);
   }
-  n += snprintf(buf + n, len - n, ",\"wind\":%.2f,\"gust\":%.2f,\"rain\":%.2f,\"tips\":%lu",
-                (double)g_wind, (double)g_gust, tips * RAIN_MM_PER_TIP, (unsigned long)tips);
-  if (g_windDir >= 0) n += snprintf(buf + n, len - n, ",\"winddir\":%d", g_windDir);
+  n += snprintf(buf + n, len - n, ",\"rain\":%.2f,\"tips\":%lu", tips * RAIN_MM_PER_TIP, (unsigned long)tips);
+  if (g_tfaPacketUs) {
+    n += snprintf(buf + n, len - n, ",\"wind\":%.2f,\"winddir\":%d,\"windbatlow\":%d", (double)g_wind, g_windDir,
+                  g_windBatLow ? 1 : 0);
+  }
   if (!isnan(g_battery)) n += snprintf(buf + n, len - n, ",\"battery\":%.2f", (double)g_battery);
   snprintf(buf + n, len - n, ",\"fw\":\"%s\"}", FW_VERSION);
 }
